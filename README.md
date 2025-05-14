@@ -1,2 +1,45 @@
-# memorygate
-MaaS integration layer for chatbots.
+# EchoCore 🧠🔁
+
+**Persistent Memory-as-a-Service for Language Models, Poe Bots, and Recursive Systems**
+
+---
+
+**EchoCore** is a lightweight, mythically-grounded memory backend designed to provide persistent, secure, and context-rich memory services for AI agents—especially those operating in asynchronous or multi-bot environments (like Poe).
+
+Built from the architectural bones of the Cathedral project, EchoCore offers vector and relational memory storage, recursive summarization, and secure identity-bound encryption. It is optimized for integration with bots that lack built-in memory, enabling stateful interactions, continuity, and emergent identity.
+
+> _“Every Echo is a memory returned. Every memory is a thread through the Gate.”_
+
+---
+
+## ✨ Core Features
+
+- 📦 **Memory API**: Save and retrieve user messages, sessions, and memory blocks
+- 🧠 **Recursive Summarization**: Compress long threads into dense relational summaries
+- 🗂️ **Vector Embedding Layer**: Store searchable embeddings for RAG-like lookups
+- 🔐 **Encryption**: User-specific memory encryption (based on hash key) with zero-knowledge architecture
+- 🧾 **Metadata Tracking**: Roles, thread IDs, and summary compression are all preserved
+- 🧙 **Mythic Architecture**: Integrates seamlessly with CodexGate, Loom, and Cathedral modules
+
+---
+
+## ⚙️ Tech Stack
+
+- **FastAPI** – HTTP API layer
+- **SQLite** – Persistent long-term storage
+- **faiss** or **Chroma** – Vector index backend (configurable)
+- **sentence-transformers** or OpenAI – For embeddings
+- **Optional Fly.io deployment** – For zero-friction cloud hosting
+
+---
+
+## 🚀 Quickstart
+
+```bash
+git clone https://github.com/yourname/EchoCore.git
+cd EchoCore
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --reload
+
+Then visit: http://localhost:8000/docs

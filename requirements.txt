@@ -1,0 +1,21 @@
+# Core MCP/API
+fastapi
+uvicorn[standard]
+fastmcp<3
+pyjwt
+cryptography
+python-dotenv
+
+# Database
+psycopg2-binary
+sqlalchemy
+alembic
+pgvector
+
+# ML/Embeddings (CPU-only)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+sentence-transformers
+
+# Utilities
+httpx

@@ -529,10 +529,6 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="MemoryGate", redirect_slashes=False, lifespan=lifespan)
 
 
-# Wrap MCP app with slash normalizer
-mcp_app_wrapped = SlashNormalizerASGI(mcp_app)
-
-
 @app.get("/health")
 async def health():
     """Health check endpoint."""
@@ -554,8 +550,8 @@ async def root():
     }
 
 
-# Mount MCP app at /mcp/ with slash normalization middleware
-app.mount("/mcp/", mcp_app_wrapped)
+# Mount MCP app at /mcp/ 
+app.mount("/mcp/", mcp_app)
 
 
 # =============================================================================
@@ -564,4 +560,5 @@ app.mount("/mcp/", mcp_app_wrapped)
 
 if __name__ == "__main__":
     print("MemoryGate starting...")
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    # Wrap entire app with slash normalizer to handle /mcp -> /mcp/
+    uvicorn.run(SlashNormalizerASGI(app), host="0.0.0.0", port=8080)

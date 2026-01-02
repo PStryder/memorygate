@@ -503,6 +503,22 @@ mcp_app = mcp.http_app(
 )
 
 
+# =============================================================================
+# Pure ASGI wrapper: Normalize /mcp to /mcp/ without buffering
+# =============================================================================
+
+class SlashNormalizerASGI:
+    """Pure ASGI middleware - no response buffering, SSE-safe."""
+    def __init__(self, wrapped_app):
+        self.wrapped_app = wrapped_app
+    
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"] == "/mcp":
+            scope = dict(scope)  # Make mutable copy
+            scope["path"] = "/mcp/"
+        await self.wrapped_app(scope, receive, send)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize on startup."""
@@ -511,6 +527,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="MemoryGate", redirect_slashes=False, lifespan=lifespan)
+
+
+# Wrap MCP app with slash normalizer
+mcp_app_wrapped = SlashNormalizerASGI(mcp_app)
 
 
 @app.get("/health")
@@ -534,8 +554,8 @@ async def root():
     }
 
 
-# Mount MCP app at /mcp (FastMCP will handle SSE at this path)
-app.mount("/mcp", mcp_app)
+# Mount MCP app at /mcp/ with slash normalization middleware
+app.mount("/mcp/", mcp_app_wrapped)
 
 
 # =============================================================================

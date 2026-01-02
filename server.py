@@ -534,8 +534,8 @@ async def root():
     }
 
 
-# Mount MCP app
-app.mount("/mcp/", mcp_app)
+# Mount MCP app (both with and without trailing slash)
+app.mount("/mcp", mcp_app)
 
 
 # =============================================================================

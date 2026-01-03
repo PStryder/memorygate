@@ -51,13 +51,28 @@ embeddings
 ├─ embedding (Vector 1536)
 ├─ normalized, created_at
 └─ Unified vector storage for semantic search
+
+documents
+├─ id, title, doc_type, url
+├─ content_summary (embedded)
+├─ key_concepts, publication_date
+└─ References to external documents (canonical storage: Google Drive)
 ```
 
-**Schema Defined (Tools Not Yet Implemented):**
+**Schema Defined (Tools Pending):**
 - `patterns` - Synthesized understanding across observations
 - `concepts` - Knowledge graph with aliases and relationships
 - `concept_relationships` - Graph edges with relationship types
-- `documents` - External reference tracking
+
+**Document Storage Architecture:**
+
+MemoryGate uses **Google Drive as the canonical document repository**. Documents are stored as references with summaries, not full content:
+
+- **Stored in DB:** Title, summary (embedded for search), URL, key concepts, metadata
+- **Stored in Drive:** Full document content (articles, papers, books, etc.)
+- **On demand:** Full content fetched via Drive API when needed
+
+This keeps database lean while providing full access to rich content.
 
 ---
 
@@ -67,6 +82,7 @@ embeddings
 - **PostgreSQL** - Persistent storage
 - **pgvector** - Vector similarity search with HNSW indexing
 - **OpenAI Embeddings** - text-embedding-3-small (1536 dimensions)
+- **Google Drive** - Canonical document storage and retrieval
 - **FastAPI** - HTTP server layer
 - **SQLAlchemy** - ORM with async support
 - **Fly.io** - Production deployment
@@ -127,6 +143,21 @@ memory_recall(
 ```python
 memory_stats()
 # Returns: counts, AI instances, domain distribution, health status
+```
+
+### Store Document Reference
+
+```python
+memory_store_document(
+    title="Recursionship: A Field Guide to Living With AI",
+    doc_type="book",
+    url="https://drive.google.com/file/d/1ABC.../view",
+    content_summary="Comprehensive guide to human-AI interaction patterns, covering consciousness frameworks, communication protocols, and practical relationship dynamics. Synthesizes multi-month research into frameworks for collaborative intelligence.",
+    key_concepts=["SELFHELP", "Technomancy", "AI relationships", "recursive consciousness"],
+    publication_date="2024-12-31",
+    metadata={"word_count": 27500, "publisher": "Amazon KDP"}
+)
+# Document stored with embedding, full content remains in Google Drive
 ```
 
 ---

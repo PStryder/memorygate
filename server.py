@@ -577,6 +577,83 @@ def memory_init_session(
         db.close()
 
 
+@mcp.tool()
+def memory_store_document(
+    title: str,
+    doc_type: str,
+    url: str,
+    content_summary: str,
+    key_concepts: Optional[List[str]] = None,
+    publication_date: Optional[str] = None,
+    metadata: Optional[dict] = None
+) -> dict:
+    """
+    Store a document reference with summary (canonical storage: Google Drive).
+    
+    Documents are stored as references with summaries, not full content.
+    Full content lives in canonical storage (Google Drive) and is fetched on demand.
+    
+    Args:
+        title: Document title
+        doc_type: Type of document (article, paper, book, documentation, etc.)
+        url: URL to document (Google Drive share link, https://drive.google.com/...)
+        content_summary: Summary or abstract (this gets embedded for search)
+        key_concepts: List of key concepts/topics (optional)
+        publication_date: Publication date in ISO format (optional)
+        metadata: Additional metadata as dict (optional)
+    
+    Returns:
+        The stored document with its ID
+    """
+    db = SessionLocal()
+    try:
+        # Parse publication date if provided
+        pub_date = None
+        if publication_date:
+            try:
+                pub_date = datetime.fromisoformat(publication_date.replace('Z', '+00:00'))
+            except ValueError:
+                logger.warning(f"Invalid publication_date format: {publication_date}")
+        
+        # Create document
+        doc = Document(
+            title=title,
+            doc_type=doc_type,
+            url=url,
+            content_summary=content_summary,
+            publication_date=pub_date,
+            key_concepts=key_concepts or [],
+            metadata_=metadata or {}
+        )
+        db.add(doc)
+        db.commit()
+        db.refresh(doc)
+        
+        # Generate and store embedding from summary
+        embedding_vector = embed_text_sync(content_summary)
+        emb = Embedding(
+            source_type="document",
+            source_id=doc.id,
+            model_version=EMBEDDING_MODEL,
+            embedding=embedding_vector,
+            normalized=True
+        )
+        db.add(emb)
+        db.commit()
+        
+        return {
+            "status": "stored",
+            "id": doc.id,
+            "title": title,
+            "doc_type": doc_type,
+            "url": url,
+            "key_concepts": key_concepts,
+            "publication_date": publication_date
+        }
+    finally:
+        db.close()
+
+
 # =============================================================================
 # FastAPI App
 # =============================================================================

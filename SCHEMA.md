@@ -19,8 +19,13 @@ MemoryGate uses PostgreSQL with the pgvector extension for vector similarity sea
 - Document references
 
 **Current Implementation Status:**
-- ✅ Fully Implemented: ai_instances, sessions, observations, embeddings
-- 🔨 Schema Defined, Tools Pending: patterns, concepts, documents, relationships
+- ✅ Fully Implemented: ai_instances, sessions, observations, embeddings, documents
+- 🔨 Schema Defined, Tools Pending: patterns, concepts, relationships
+
+**Document Storage:**
+- Documents stored as references with summaries (not full content)
+- Canonical storage: Google Drive
+- Full content fetched on demand via Drive API
 
 ---
 
@@ -380,7 +385,24 @@ CREATE TABLE concept_relationships (
 
 ### documents
 
-External document references with key concepts.
+External document references with summaries (canonical storage: Google Drive).
+
+**Architecture:**
+MemoryGate stores document *references* with summaries, not full content. Full document content lives in canonical storage (Google Drive) and is fetched on demand via Drive API.
+
+**What's stored in database:**
+- Metadata (title, doc_type, publication date)
+- Summary/abstract (embedded for semantic search)
+- URL (Google Drive share link or file ID)
+- Key concepts (extracted topics)
+- Arbitrary metadata (word count, publisher, etc.)
+
+**What's NOT stored:**
+- Full document content (articles, papers, books)
+- Binary data (PDFs, images)
+- Raw HTML/markdown
+
+**Cost savings:** ~100x storage reduction (500 bytes summary vs 50KB full document)
 
 ```sql
 CREATE TABLE documents (
@@ -390,8 +412,8 @@ CREATE TABLE documents (
     content_summary     TEXT,
     url                 VARCHAR(1000),
     publication_date    TIMESTAMP WITH TIME ZONE,
-    key_concepts        JSONB DEFAULT '[]',
-    metadata            JSONB DEFAULT '{}',
+    key_concepts        JSONB DEFAULT list,
+    metadata            JSONB DEFAULT dict,
     access_count        INTEGER DEFAULT 0,
     last_accessed       TIMESTAMP WITH TIME ZONE,
     created_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW()
@@ -401,18 +423,28 @@ CREATE TABLE documents (
 **Columns:**
 - `id` - Auto-increment primary key
 - `title` - Document title
-- `doc_type` - Document type (article, paper, post, documentation)
-- `content_summary` - Summary text (embedded for search)
-- `url` - Document URL
+- `doc_type` - Document type (article, paper, book, documentation)
+- `content_summary` - Summary text (this gets embedded for semantic search)
+- `url` - Google Drive share link or file ID (https://drive.google.com/...)
 - `publication_date` - Publication timestamp
 - `key_concepts` - JSONB array of associated concept names
-- `metadata` - JSONB for arbitrary metadata
+- `metadata` - JSONB for arbitrary metadata (word count, publisher, etc.)
 - `access_count` / `last_accessed` - Usage tracking
 - `created_at` - Record creation timestamp
 
-**Planned Tools:**
-- `memory_store_document()` - Add document reference
-- `memory_search_documents()` - Semantic search
+**Relationships:**
+- Polymorphically linked to embeddings via (source_type='document', source_id)
+- Logical links to concepts via key_concepts array
+
+**MCP Tools:**
+- Created by: `memory_store_document()` ✅ Implemented
+- Retrieved by: `memory_search()` (unified search) ✅ Implemented
+
+**Usage Workflow:**
+1. Store document with `memory_store_document(title, url, summary, key_concepts)`
+2. Summary gets embedded automatically
+3. Later: `memory_search("AI consciousness frameworks")` finds document via semantic similarity
+4. Fetch full content from Google Drive when needed (not yet implemented - future enhancement)
 
 ---
 
@@ -580,6 +612,12 @@ Core principles that guide system behavior and future development:
    - No cascading deletes configured
    - Deletion requires explicit cleanup to prevent accidental data loss
    - Polymorphic relationships maintained in application logic
+
+6. **Document Storage Architecture:**
+   - Documents stored as references, not full content
+   - Canonical storage: Google Drive
+   - Summary embedded for search; full content fetched on demand
+   - Reduces database storage by ~100x while maintaining full access
 
 ---
 

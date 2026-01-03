@@ -19,8 +19,8 @@ MemoryGate uses PostgreSQL with the pgvector extension for vector similarity sea
 - Document references
 
 **Current Implementation Status:**
-- ✅ Fully Implemented: ai_instances, sessions, observations, embeddings, documents, concepts, concept_aliases, concept_relationships
-- 🔨 Schema Defined, Tools Pending: patterns
+- ✅ Fully Implemented: ai_instances, sessions, observations, embeddings, documents, concepts, concept_aliases, concept_relationships, patterns
+- 🎉 All core features complete!
 
 **Document Storage:**
 - Documents stored as references with summaries (not full content)
@@ -210,11 +210,9 @@ CREATE INDEX ix_embeddings_vector_hnsw ON embeddings USING hnsw (embedding vecto
 
 ---
 
-## Schema Defined (Tools Not Yet Implemented)
-
 ### patterns
 
-Synthesized understanding across multiple observations - higher-level insights.
+Synthesized understanding across multiple observations - higher-level insights that evolve over time.
 
 ```sql
 CREATE TABLE patterns (
@@ -224,7 +222,7 @@ CREATE TABLE patterns (
     pattern_text                TEXT NOT NULL,
     confidence                  FLOAT DEFAULT 0.8,
     last_updated                TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    evidence_observation_ids    JSONB DEFAULT '[]',
+    evidence_observation_ids    JSONB DEFAULT list,
     session_id                  INTEGER REFERENCES sessions(id),
     ai_instance_id              INTEGER REFERENCES ai_instances(id),
     access_count                INTEGER DEFAULT 0,
@@ -237,26 +235,35 @@ CREATE INDEX ix_patterns_category ON patterns(category);
 
 **Columns:**
 - `id` - Auto-increment primary key
-- `category` - Pattern category
+- `category` - Pattern category/domain
 - `pattern_name` - Pattern identifier (unique within category)
-- `pattern_text` - Pattern description (embedded for search)
-- `confidence` - Pattern confidence level
-- `last_updated` - Auto-updated timestamp
+- `pattern_text` - Pattern description (this gets embedded for semantic search)
+- `confidence` - Pattern confidence level 0.0-1.0
+- `last_updated` - Auto-updated on modification
 - `evidence_observation_ids` - JSONB array of supporting observation IDs
 - `session_id` - Optional session link
 - `ai_instance_id` - AI that synthesized the pattern
 - `access_count` / `last_accessed` - Usage tracking
 
-**Unique Constraint:** (category, pattern_name)
+**Unique Constraint:** (category, pattern_name) - prevents duplicates
 
 **Relationships:**
 - Many-to-one with sessions (optional)
 - Many-to-one with ai_instances
 - Logical links to observations via evidence_observation_ids
+- Polymorphically linked to embeddings via (source_type='pattern', source_id)
 
-**Planned Tools:**
-- `memory_get_patterns()` - Retrieve patterns by category
-- `memory_update_pattern()` - Create/update pattern
+**Pattern Evolution:**
+Patterns are designed to evolve as understanding grows. The `memory_update_pattern()` tool performs upsert:
+- If pattern exists (by category + pattern_name), updates pattern_text, confidence, evidence
+- If pattern doesn't exist, creates new pattern
+- Embedding is regenerated on each update
+
+**MCP Tools:**
+- Created/Updated by: `memory_update_pattern()` ✅ Implemented (upsert)
+- Retrieved by: `memory_get_pattern()` ✅ Implemented
+- Listed by: `memory_patterns()` ✅ Implemented (with category/confidence filters)
+- Retrieved by: `memory_search()` (unified semantic search) ✅ Implemented
 
 ---
 

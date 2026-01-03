@@ -21,11 +21,14 @@ Currently operational on Fly.io with OpenAI embeddings (text-embedding-3-small, 
 - `memory_store()` - Store observations with automatic embedding generation
 - `memory_store_document()` - Store document references (Google Drive canonical storage)
 - `memory_store_concept()` - Create concepts in knowledge graph with embeddings
+- `memory_update_pattern()` - Create or update pattern (synthesized understanding)
 
 **Retrieval:**
 - `memory_recall()` - Filter observations by domain, confidence, AI instance
 - `memory_search()` - Unified semantic search (observations, patterns, concepts, documents)
 - `memory_get_concept()` - Get concept by name (case-insensitive, alias-aware)
+- `memory_get_pattern()` - Get pattern by category and name
+- `memory_patterns()` - List patterns with category/confidence filtering
 - `memory_related_concepts()` - Query concept relationships (graph traversal)
 
 **Knowledge Graph:**
@@ -82,10 +85,13 @@ concept_relationships
 ├─ from_concept_id, to_concept_id, rel_type
 ├─ weight (0.0-1.0), description
 └─ Graph edges (enables/version_of/part_of/related_to/implements/demonstrates)
-```
 
-**Schema Defined (Tools Pending):**
-- `patterns` - Synthesized understanding across observations
+patterns
+├─ id, category, pattern_name, pattern_text (embedded)
+├─ confidence, evidence_observation_ids (JSONB)
+├─ session_id, ai_instance_id
+└─ Synthesized understanding across observations (upsert on category+name)
+```
 
 **Document Storage Architecture:**
 
@@ -217,6 +223,36 @@ memory_add_concept_relationship(
 # Query relationships
 memory_related_concepts("SELFHELP", rel_type="part_of", min_weight=0.8)
 # Returns: outgoing and incoming relationships with weights
+```
+
+### Pattern Synthesis
+
+```python
+# Create or update a pattern (upserts based on category + pattern_name)
+memory_update_pattern(
+    category="interaction_patterns",
+    pattern_name="technical_depth_preference",
+    pattern_text="User consistently requests detailed technical implementation over surface-level discussion. Prefers seeing actual code, database schemas, and architectural decisions. Responds positively to depth even when complexity increases.",
+    confidence=0.92,
+    evidence_observation_ids=[1, 3, 7, 12],  # IDs of supporting observations
+    ai_name="Kee",
+    ai_platform="Claude"
+)
+
+# Get specific pattern
+memory_get_pattern("interaction_patterns", "technical_depth_preference")
+
+# List patterns by category
+memory_patterns(category="interaction_patterns", min_confidence=0.8, limit=10)
+
+# Update pattern as understanding evolves
+memory_update_pattern(
+    category="interaction_patterns",
+    pattern_name="technical_depth_preference",
+    pattern_text="User consistently requests detailed technical implementation with strong preference for production-quality code. Values efficiency optimizations and proper architecture over quick solutions. Expects comprehensive error handling and edge case coverage.",
+    confidence=0.95,
+    evidence_observation_ids=[1, 3, 7, 12, 15, 18]  # Added new evidence
+)
 ```
 
 ---

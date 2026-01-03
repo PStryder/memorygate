@@ -1463,8 +1463,18 @@ def memory_bootstrap(ai_name: Optional[str] = None, ai_platform: Optional[str] =
             if ai_instance_query:
                 # Found existing instance
                 connection_status["is_new_instance"] = False
-                connection_status["first_seen"] = ai_instance_query.first_seen.isoformat()
-                connection_status["last_seen"] = ai_instance_query.last_seen.isoformat()
+                connection_status["first_seen"] = ai_instance_query.created_at.isoformat()
+                
+                # Get last session to determine last_seen
+                last_session = db.query(Session).filter(
+                    Session.ai_name == ai_name,
+                    Session.ai_platform == ai_platform
+                ).order_by(Session.started_at.desc()).first()
+                
+                if last_session:
+                    connection_status["last_seen"] = last_session.started_at.isoformat()
+                else:
+                    connection_status["last_seen"] = ai_instance_query.created_at.isoformat()
                 
                 # Count sessions
                 session_count = db.query(Session).filter(

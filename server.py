@@ -177,16 +177,16 @@ def memory_search(
     domain: Optional[str] = None
 ) -> dict:
     """
-    Semantic search across observations.
+    Unified semantic search across all memory types (observations, patterns, concepts, documents).
     
     Args:
         query: Search query text
         limit: Maximum results to return (default 5)
         min_confidence: Minimum confidence threshold (0.0-1.0)
-        domain: Optional domain filter
+        domain: Optional domain filter (applies to observations only)
     
     Returns:
-        List of matching observations with similarity scores
+        List of matching items from all sources with similarity scores and source_type
     """
     db = SessionLocal()
     try:
@@ -196,24 +196,79 @@ def memory_search(
         # Format embedding for pgvector
         embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
         
-        # Build query with vector similarity using explicit cast
+        # Unified search across all embedded types
         sql = text("""
             SELECT 
-                o.id,
-                o.observation,
-                o.confidence,
-                o.domain,
-                o.timestamp,
-                o.evidence,
-                ai.name as ai_name,
-                s.title as session_title,
+                e.source_type,
+                e.source_id,
+                CASE 
+                    WHEN e.source_type = 'observation' THEN o.observation
+                    WHEN e.source_type = 'pattern' THEN p.pattern_text
+                    WHEN e.source_type = 'concept' THEN c.description
+                    WHEN e.source_type = 'document' THEN d.content_summary
+                END as content,
+                CASE 
+                    WHEN e.source_type = 'observation' THEN o.confidence
+                    WHEN e.source_type = 'pattern' THEN p.confidence
+                    ELSE 1.0
+                END as confidence,
+                CASE 
+                    WHEN e.source_type = 'observation' THEN o.domain
+                    WHEN e.source_type = 'pattern' THEN p.category
+                    WHEN e.source_type = 'concept' THEN c.domain
+                    WHEN e.source_type = 'document' THEN d.doc_type
+                END as domain_or_category,
+                CASE 
+                    WHEN e.source_type = 'observation' THEN o.timestamp
+                    WHEN e.source_type = 'pattern' THEN p.last_updated
+                    WHEN e.source_type = 'concept' THEN c.created_at
+                    WHEN e.source_type = 'document' THEN d.created_at
+                END as timestamp,
+                CASE 
+                    WHEN e.source_type = 'observation' THEN o.evidence
+                    WHEN e.source_type = 'pattern' THEN p.evidence_observation_ids
+                    WHEN e.source_type = 'concept' THEN c.metadata_
+                    WHEN e.source_type = 'document' THEN d.key_concepts
+                END as metadata,
+                CASE 
+                    WHEN e.source_type = 'observation' THEN obs_ai.name
+                    WHEN e.source_type = 'pattern' THEN pat_ai.name
+                    WHEN e.source_type = 'concept' THEN con_ai.name
+                    ELSE NULL
+                END as ai_name,
+                CASE 
+                    WHEN e.source_type = 'observation' THEN obs_s.title
+                    WHEN e.source_type = 'pattern' THEN pat_s.title
+                    ELSE NULL
+                END as session_title,
+                CASE 
+                    WHEN e.source_type = 'concept' THEN c.name
+                    WHEN e.source_type = 'pattern' THEN p.pattern_name
+                    WHEN e.source_type = 'document' THEN d.title
+                    ELSE NULL
+                END as item_name,
                 1 - (e.embedding <=> (:embedding)::vector) as similarity
-            FROM observations o
-            JOIN embeddings e ON e.source_type = 'observation' AND e.source_id = o.id
-            LEFT JOIN ai_instances ai ON o.ai_instance_id = ai.id
-            LEFT JOIN sessions s ON o.session_id = s.id
-            WHERE o.confidence >= :min_confidence
-            AND (:domain IS NULL OR o.domain = :domain)
+            FROM embeddings e
+            LEFT JOIN observations o ON e.source_type = 'observation' AND e.source_id = o.id
+            LEFT JOIN patterns p ON e.source_type = 'pattern' AND e.source_id = p.id
+            LEFT JOIN concepts c ON e.source_type = 'concept' AND e.source_id = c.id
+            LEFT JOIN documents d ON e.source_type = 'document' AND e.source_id = d.id
+            LEFT JOIN ai_instances obs_ai ON o.ai_instance_id = obs_ai.id
+            LEFT JOIN ai_instances pat_ai ON p.ai_instance_id = pat_ai.id
+            LEFT JOIN ai_instances con_ai ON c.ai_instance_id = con_ai.id
+            LEFT JOIN sessions obs_s ON o.session_id = obs_s.id
+            LEFT JOIN sessions pat_s ON p.session_id = pat_s.id
+            WHERE (
+                CASE 
+                    WHEN e.source_type = 'observation' THEN o.confidence
+                    WHEN e.source_type = 'pattern' THEN p.confidence
+                    ELSE 1.0
+                END >= :min_confidence
+            )
+            AND (
+                :domain IS NULL 
+                OR (e.source_type = 'observation' AND o.domain = :domain)
+            )
             ORDER BY e.embedding <=> (:embedding)::vector
             LIMIT :limit
         """)
@@ -225,12 +280,28 @@ def memory_search(
             "limit": limit
         }).fetchall()
         
-        # Update access counts
+        # Update access counts for each source type
         for row in results:
-            db.execute(
-                text("UPDATE observations SET access_count = access_count + 1, last_accessed = NOW() WHERE id = :id"),
-                {"id": row.id}
-            )
+            if row.source_type == 'observation':
+                db.execute(
+                    text("UPDATE observations SET access_count = access_count + 1, last_accessed = NOW() WHERE id = :id"),
+                    {"id": row.source_id}
+                )
+            elif row.source_type == 'pattern':
+                db.execute(
+                    text("UPDATE patterns SET access_count = access_count + 1, last_accessed = NOW() WHERE id = :id"),
+                    {"id": row.source_id}
+                )
+            elif row.source_type == 'concept':
+                db.execute(
+                    text("UPDATE concepts SET access_count = access_count + 1, last_accessed = NOW() WHERE id = :id"),
+                    {"id": row.source_id}
+                )
+            elif row.source_type == 'document':
+                db.execute(
+                    text("UPDATE documents SET access_count = access_count + 1, last_accessed = NOW() WHERE id = :id"),
+                    {"id": row.source_id}
+                )
         db.commit()
         
         return {
@@ -238,12 +309,14 @@ def memory_search(
             "count": len(results),
             "results": [
                 {
-                    "id": row.id,
-                    "observation": row.observation,
+                    "source_type": row.source_type,
+                    "id": row.source_id,
+                    "content": row.content,
+                    "name": row.item_name,
                     "confidence": row.confidence,
-                    "domain": row.domain,
+                    "domain": row.domain_or_category,
                     "timestamp": row.timestamp.isoformat() if row.timestamp else None,
-                    "evidence": row.evidence,
+                    "metadata": row.metadata,
                     "ai_name": row.ai_name,
                     "session_title": row.session_title,
                     "similarity": float(row.similarity)

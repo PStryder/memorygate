@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 import httpx
 import uvicorn
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastmcp import FastMCP
 from sqlalchemy import create_engine, text, func, desc
 from sqlalchemy.orm import sessionmaker
@@ -83,6 +84,9 @@ def init_db():
     with engine.connect() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         conn.commit()
+    
+    # Import OAuth models to register tables with Base
+    import oauth_models  # noqa: F401
     
     # THEN: Create tables (which depend on vector type)
     logger.info("Creating tables...")
@@ -1278,6 +1282,25 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="MemoryGate", redirect_slashes=False, lifespan=lifespan)
 
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        os.environ.get("FRONTEND_URL", "http://localhost:3000"),
+        "http://localhost:3000",
+        "https://memorygate.ai",
+        "https://www.memorygate.ai"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount OAuth routes
+from oauth_routes import router as auth_router
+from mcp_auth_gate import MCPAuthGateASGI
+app.include_router(auth_router)
+
 
 @app.get("/health")
 async def health():
@@ -1295,13 +1318,20 @@ async def root():
         "embedding_model": EMBEDDING_MODEL,
         "endpoints": {
             "health": "/health",
-            "mcp": "/mcp"
+            "mcp": "/mcp",
+            "auth": {
+                "client_credentials": "/auth/client",
+                "login_google": "/auth/login/google",
+                "login_github": "/auth/login/github",
+                "me": "/auth/me",
+                "api_keys": "/auth/api-keys"
+            }
         }
     }
 
 
-# Mount MCP app at /mcp/ 
-app.mount("/mcp/", mcp_app)
+# Mount MCP app at /mcp/ with auth gate (SessionLocal injected to avoid import cycle)
+app.mount("/mcp/", MCPAuthGateASGI(mcp_app, SessionLocal))
 
 
 # =============================================================================

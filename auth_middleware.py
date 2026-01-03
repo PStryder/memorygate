@@ -107,7 +107,7 @@ def verify_request_api_key(db: Session, headers: dict) -> Optional[User]:
 
 
 async def get_current_user_from_session(
-    db: Session,
+    db,
     session_token: Annotated[Optional[str], Cookie(alias="mg_session")] = None
 ) -> Optional[User]:
     """Get user from session token (cookie)"""
@@ -129,7 +129,7 @@ async def get_current_user_from_session(
 
 
 async def get_current_user_from_api_key(
-    db: Session,
+    db,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
     x_api_key: Annotated[Optional[str], Header()] = None
 ) -> Optional[User]:
@@ -176,7 +176,7 @@ async def get_current_user_from_api_key(
 
 
 async def get_current_user(
-    db: Session,
+    db,
     user_from_session: Annotated[Optional[User], Depends(get_current_user_from_session)],
     user_from_api_key: Annotated[Optional[User], Depends(get_current_user_from_api_key)]
 ) -> Optional[User]:

@@ -499,6 +499,7 @@ def memory_stats() -> dict:
         obs_count = db.query(func.count(Observation.id)).scalar()
         pattern_count = db.query(func.count(Pattern.id)).scalar()
         concept_count = db.query(func.count(Concept.id)).scalar()
+        document_count = db.query(func.count(Document.id)).scalar()
         session_count = db.query(func.count(Session.id)).scalar()
         ai_count = db.query(func.count(AIInstance.id)).scalar()
         embedding_count = db.query(func.count(Embedding.source_id)).scalar()
@@ -519,6 +520,7 @@ def memory_stats() -> dict:
                 "observations": obs_count,
                 "patterns": pattern_count,
                 "concepts": concept_count,
+                "documents": document_count,
                 "sessions": session_count,
                 "ai_instances": ai_count,
                 "embeddings": embedding_count

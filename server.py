@@ -1428,53 +1428,114 @@ memory_update_pattern(
 
 
 @mcp.tool()
-def memory_bootstrap() -> dict:
+def memory_bootstrap(ai_name: Optional[str] = None, ai_platform: Optional[str] = None) -> dict:
     """
-    Quick bootstrap guide for new AI agents.
+    Stateful bootstrap for AI agents - tells you your relationship status with MemoryGate.
     
-    Returns minimal "getting started" checklist.
-    Optimized for first-time setup.
+    Returns compatibility info, connection history, and getting started guide.
+    The system tells you what it already knows about you.
+    
+    Args:
+        ai_name: Your AI instance name (e.g., "Kee", "Hexy")
+        ai_platform: Your platform (e.g., "Claude", "ChatGPT")
     
     Returns:
-        Essential information to start using MemoryGate
+        Relationship status, version info, and usage guide
     """
-    return {
-        "spec_version": SPEC_VERSION,
-        "first_steps": [
-            {
-                "step": 1,
-                "action": "Initialize session",
-                "tool": "memory_init_session",
-                "required_params": ["conversation_id", "title", "ai_name", "ai_platform"],
+    db = DB.SessionLocal()
+    try:
+        # Check if this AI instance has history
+        connection_status = {
+            "is_new_instance": True,
+            "first_seen": None,
+            "last_seen": None,
+            "session_count": 0,
+            "total_observations": 0,
+        }
+        
+        if ai_name and ai_platform:
+            # Query for this AI instance's history
+            ai_instance_query = db.query(AIInstance).filter(
+                AIInstance.name == ai_name,
+                AIInstance.platform == ai_platform
+            ).first()
+            
+            if ai_instance_query:
+                # Found existing instance
+                connection_status["is_new_instance"] = False
+                connection_status["first_seen"] = ai_instance_query.first_seen.isoformat()
+                connection_status["last_seen"] = ai_instance_query.last_seen.isoformat()
+                
+                # Count sessions
+                session_count = db.query(Session).filter(
+                    Session.ai_name == ai_name,
+                    Session.ai_platform == ai_platform
+                ).count()
+                connection_status["session_count"] = session_count
+                
+                # Count observations contributed by this AI
+                obs_count = db.query(Observation).filter(
+                    Observation.ai_name == ai_name,
+                    Observation.ai_platform == ai_platform
+                ).count()
+                connection_status["total_observations"] = obs_count
+        
+        return {
+            "spec_version": SPEC_VERSION,
+            "role": "agent_bootstrap",
+            "connection_status": connection_status,
+            "assumptions": [
+                "You are an AI agent using MCP",
+                "You may reconnect across sessions",
+                "You should externalize durable memory here",
+                "Memory persists between your instances",
+                "Other AI agents may also use this memory"
+            ],
+            "compatibility": {
+                "spec_version": SPEC_VERSION,
+                "breaking_changes_since": None,  # Future: track version bumps
+                "recommended_action": "Use normally" if not connection_status["is_new_instance"] else "Initialize new session"
             },
-            {
-                "step": 2,
-                "action": "Search for relevant context",
-                "tool": "memory_search",
-                "params": {"query": "topic keywords", "limit": 5},
-            },
-            {
-                "step": 3,
-                "action": "Store new observations",
-                "tool": "memory_store",
-                "params": {
-                    "observation": "What you learned",
-                    "confidence": 0.8,
-                    "domain": "appropriate_domain",
-                    "evidence": ["supporting facts"],
+            "first_steps": [
+                {
+                    "step": 1,
+                    "action": "Initialize session" if connection_status["is_new_instance"] else "Initialize this session",
+                    "tool": "memory_init_session",
+                    "required_params": ["conversation_id", "title", "ai_name", "ai_platform"],
+                    "note": "Creates session record and updates last_seen" if not connection_status["is_new_instance"] else "Registers you as new AI instance"
                 },
-            },
-        ],
-        "critical_rules": [
-            "ALWAYS call memory_init_session() first",
-            "Search liberally - it's fast (~50ms)",
-            "Concept names are case-insensitive",
-            "Use confidence weights honestly (0.0-1.0)",
-        ],
-        "recommended_domains": RECOMMENDED_DOMAINS,
-        "confidence_guide": CONFIDENCE_GUIDE,
-        "next_step": "Call memory_user_guide() for full documentation",
-    }
+                {
+                    "step": 2,
+                    "action": "Search for relevant context",
+                    "tool": "memory_search",
+                    "params": {"query": "topic keywords", "limit": 5},
+                    "note": f"You have {connection_status['total_observations']} observations in the system" if connection_status["total_observations"] > 0 else "System is empty - you'll build memory as you go"
+                },
+                {
+                    "step": 3,
+                    "action": "Store new observations",
+                    "tool": "memory_store",
+                    "params": {
+                        "observation": "What you learned",
+                        "confidence": 0.8,
+                        "domain": "appropriate_domain",
+                        "evidence": ["supporting facts"],
+                    },
+                },
+            ],
+            "critical_rules": [
+                "ALWAYS call memory_init_session() at conversation start",
+                "Search liberally - it's fast (~50ms)",
+                "Concept names are case-insensitive",
+                "Use confidence weights honestly (0.0-1.0)",
+                "Documents are references only (Google Drive = canonical storage)"
+            ],
+            "recommended_domains": RECOMMENDED_DOMAINS,
+            "confidence_guide": CONFIDENCE_GUIDE,
+            "next_step": "Call memory_user_guide() for full documentation",
+        }
+    finally:
+        db.close()
 
 
 # =============================================================================

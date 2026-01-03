@@ -23,9 +23,9 @@ class MCPAuthGateASGI:
     - Respects REQUIRE_MCP_AUTH env flag
     """
     
-    def __init__(self, wrapped_app, session_factory):
+    def __init__(self, wrapped_app, sessionmaker_getter):
         self.wrapped_app = wrapped_app
-        self.session_factory = session_factory
+        self.get_sessionmaker = sessionmaker_getter
         self.require_auth = os.environ.get("REQUIRE_MCP_AUTH", "true").lower() == "true"
     
     async def __call__(self, scope, receive, send):
@@ -53,8 +53,12 @@ class MCPAuthGateASGI:
             for k, v in headers.items()
         }
         
-        # Get database session (session_factory is callable that returns SessionLocal class)
-        SessionLocal = self.session_factory()
+        # Get database session (late binding - sessionmaker set after init_db)
+        SessionLocal = self.get_sessionmaker()
+        if SessionLocal is None:
+            await self._send_503(send)
+            return
+        
         db = SessionLocal()
         
         try:
@@ -81,6 +85,27 @@ class MCPAuthGateASGI:
         await send({
             "type": "http.response.start",
             "status": 401,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(response_body)).encode()),
+            ],
+        })
+        
+        await send({
+            "type": "http.response.body",
+            "body": response_body,
+        })
+    
+    async def _send_503(self, send):
+        """Send 503 Service Unavailable response."""
+        response_body = json.dumps({
+            "error": "Service Unavailable",
+            "message": "Database not initialized - server is starting up"
+        }).encode()
+        
+        await send({
+            "type": "http.response.start",
+            "status": 503,
             "headers": [
                 (b"content-type", b"application/json"),
                 (b"content-length", str(len(response_body)).encode()),

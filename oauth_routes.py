@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from oauth import OAuthProviderFactory
 from oauth_models import User, UserSession, OAuthState, APIKey
 from auth_middleware import get_current_user, require_auth
+from server import DB  # Import DB holder class
 
 
 # Router
@@ -40,11 +41,10 @@ OAUTH_PROVIDERS = {
 
 
 def get_db_session():
-    """Database dependency"""
-    import server  # Import module, not the name
-    if server.DB.SessionLocal is None:
+    """Database dependency (late binding to DB.SessionLocal)"""
+    if DB.SessionLocal is None:
         raise RuntimeError("Database not initialized - SessionLocal is None")
-    db = server.DB.SessionLocal()  # Access via DB class
+    db = DB.SessionLocal()
     try:
         yield db
     finally:

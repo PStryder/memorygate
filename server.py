@@ -1467,8 +1467,7 @@ def memory_bootstrap(ai_name: Optional[str] = None, ai_platform: Optional[str] =
                 
                 # Get last session to determine last_seen
                 last_session = db.query(Session).filter(
-                    Session.ai_name == ai_name,
-                    Session.ai_platform == ai_platform
+                    Session.ai_instance_id == ai_instance_query.id
                 ).order_by(Session.started_at.desc()).first()
                 
                 if last_session:
@@ -1478,8 +1477,7 @@ def memory_bootstrap(ai_name: Optional[str] = None, ai_platform: Optional[str] =
                 
                 # Count sessions
                 session_count = db.query(Session).filter(
-                    Session.ai_name == ai_name,
-                    Session.ai_platform == ai_platform
+                    Session.ai_instance_id == ai_instance_query.id
                 ).count()
                 connection_status["session_count"] = session_count
                 

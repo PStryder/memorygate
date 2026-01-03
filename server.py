@@ -46,6 +46,28 @@ logger = logging.getLogger("memorygate")
 
 engine = None
 SessionLocal = None
+http_client = None  # Reusable HTTP client for OpenAI API
+
+
+def init_http_client():
+    """Initialize HTTP client for OpenAI API calls."""
+    global http_client
+    http_client = httpx.Client(
+        timeout=30.0,
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json"
+        }
+    )
+    logger.info("HTTP client initialized")
+
+
+def cleanup_http_client():
+    """Clean up HTTP client on shutdown."""
+    global http_client
+    if http_client:
+        http_client.close()
+        logger.info("HTTP client closed")
 
 
 def init_db():
@@ -102,23 +124,17 @@ async def embed_text(text: str) -> List[float]:
 
 
 def embed_text_sync(text: str) -> List[float]:
-    """Synchronous version of embed_text."""
-    with httpx.Client() as client:
-        response = client.post(
-            "https://api.openai.com/v1/embeddings",
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": EMBEDDING_MODEL,
-                "input": text
-            },
-            timeout=30.0
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data["data"][0]["embedding"]
+    """Synchronous version of embed_text using pooled HTTP client."""
+    response = http_client.post(
+        "https://api.openai.com/v1/embeddings",
+        json={
+            "model": EMBEDDING_MODEL,
+            "input": text
+        }
+    )
+    response.raise_for_status()
+    data = response.json()
+    return data["data"][0]["embedding"]
 
 
 # =============================================================================
@@ -193,10 +209,8 @@ def memory_search(
         # Generate query embedding
         query_embedding = embed_text_sync(query)
         
-        # Format embedding for pgvector
-        embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
-        
         # Unified search across all embedded types
+        # Note: pgvector's cast() handles vector conversion natively
         sql = text("""
             SELECT 
                 e.source_type,
@@ -247,7 +261,7 @@ def memory_search(
                     WHEN e.source_type = 'document' THEN d.title
                     ELSE NULL
                 END as item_name,
-                1 - (e.embedding <=> (:embedding)::vector) as similarity
+                1 - (e.embedding <=> cast(:embedding as vector)) as similarity
             FROM embeddings e
             LEFT JOIN observations o ON e.source_type = 'observation' AND e.source_id = o.id
             LEFT JOIN patterns p ON e.source_type = 'pattern' AND e.source_id = p.id
@@ -269,12 +283,12 @@ def memory_search(
                 :domain IS NULL 
                 OR (e.source_type = 'observation' AND o.domain = :domain)
             )
-            ORDER BY e.embedding <=> (:embedding)::vector
+            ORDER BY e.embedding <=> cast(:embedding as vector)
             LIMIT :limit
         """)
         
         results = db.execute(sql, {
-            "embedding": embedding_str,
+            "embedding": str(query_embedding),  # pgvector handles list conversion
             "min_confidence": min_confidence,
             "domain": domain,
             "limit": limit
@@ -594,9 +608,11 @@ class SlashNormalizerASGI:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Initialize on startup."""
+    """Initialize on startup, cleanup on shutdown."""
     init_db()
+    init_http_client()
     yield
+    cleanup_http_client()
 
 
 app = FastAPI(title="MemoryGate", redirect_slashes=False, lifespan=lifespan)

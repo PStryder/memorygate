@@ -49,7 +49,7 @@ class Session(Base):
     started_at = Column(DateTime(timezone=True), default=datetime.utcnow)
     last_active = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
     summary = Column(Text)
-    metadata_ = Column("metadata", JSONB, default={})
+    metadata_ = Column("metadata", JSONB, default=dict)
     
     # Relationships
     ai_instance = relationship("AIInstance", back_populates="sessions")
@@ -69,7 +69,7 @@ class Observation(Base):
     observation = Column(Text, nullable=False)
     confidence = Column(Float, default=0.8)
     domain = Column(String(100))
-    evidence = Column(JSONB, default=[])
+    evidence = Column(JSONB, default=list)
     
     # Provenance
     session_id = Column(Integer, ForeignKey("sessions.id"))
@@ -103,7 +103,7 @@ class Pattern(Base):
     pattern_text = Column(Text, nullable=False)
     confidence = Column(Float, default=0.8)
     last_updated = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
-    evidence_observation_ids = Column(JSONB, default=[])
+    evidence_observation_ids = Column(JSONB, default=list)
     
     # Provenance
     session_id = Column(Integer, ForeignKey("sessions.id"))
@@ -137,7 +137,7 @@ class Concept(Base):
     status = Column(String(50))
     domain = Column(String(100))
     description = Column(Text)  # Used for embedding
-    metadata_ = Column("metadata", JSONB, default={})
+    metadata_ = Column("metadata", JSONB, default=dict)
     
     # Provenance
     ai_instance_id = Column(Integer, ForeignKey("ai_instances.id"))
@@ -196,8 +196,8 @@ class Document(Base):
     content_summary = Column(Text)
     url = Column(String(1000))
     publication_date = Column(DateTime(timezone=True))
-    key_concepts = Column(JSONB, default=[])
-    metadata_ = Column("metadata", JSONB, default={})
+    key_concepts = Column(JSONB, default=list)
+    metadata_ = Column("metadata", JSONB, default=dict)
     
     # Access tracking
     access_count = Column(Integer, default=0)

@@ -78,7 +78,7 @@ CREATE TABLE sessions (
 
 **Columns:**
 - `id` - Auto-increment primary key
-- `conversation_id` - UUID from conversation URL (e.g., Claude chat UUID) - UNIQUE
+- `conversation_id` - Opaque stable identifier from conversation URL (often UUID, but format varies by platform) - UNIQUE
 - `title` - Conversation title
 - `ai_instance_id` - Foreign key to ai_instances
 - `source_url` - Full URL to conversation (e.g., https://claude.ai/chat/...)
@@ -86,6 +86,8 @@ CREATE TABLE sessions (
 - `last_active` - Last activity timestamp (auto-updates on modification)
 - `summary` - Optional conversation summary
 - `metadata` - JSONB field for arbitrary metadata
+
+**Note:** In the SQLAlchemy ORM, some columns may be suffixed with `_` to avoid reserved attribute names (e.g., `metadata_` in Python maps to `metadata` in SQL).
 
 **Relationships:**
 - Many-to-one with ai_instances
@@ -149,7 +151,7 @@ CREATE INDEX ix_observations_confidence ON observations(confidence);
 **Relationships:**
 - Many-to-one with sessions (optional)
 - Many-to-one with ai_instances
-- One-to-one with embeddings (via source_type/source_id)
+- Polymorphically linked to embeddings via (source_type='observation', source_id) - no FK constraint, integrity maintained in application logic
 
 **MCP Tools:**
 - Created by: `memory_store()`
@@ -192,12 +194,14 @@ CREATE INDEX ix_embeddings_vector_hnsw ON embeddings USING hnsw (embedding vecto
 
 **Vector Operations:**
 - Cosine similarity: `1 - (embedding <=> query_embedding)`
-- Used by `memory_search()` for semantic search
+- Used by `memory_search()` for unified semantic search across all source types
 
 **Notes:**
-- Embeddings are generated asynchronously via OpenAI API
-- HNSW index provides approximate nearest neighbor search
+- Embeddings are generated at write/search time by calling the OpenAI embeddings API (currently synchronous in the MCP tool path)
+- Embeddings are polymorphically linked to source entities; there is no FK constraint - integrity is maintained in application logic
+- HNSW index creation is best-effort; if unsupported by pgvector version, the system still functions with brute-force vector operations
 - All vectors normalized to unit length for consistent similarity metrics
+- ORM uses callable defaults (dict/list) for JSONB fields to avoid shared mutable defaults
 
 ---
 
@@ -463,13 +467,13 @@ fly apps restart memorygate
 
 ```
 1. User calls memory_search(query="...")
-2. Generate query embedding via OpenAI API
-3. Execute pgvector similarity query:
-   SELECT * FROM observations o
-   JOIN embeddings e ON e.source_id = o.id
+2. Generate query embedding via OpenAI API (synchronous)
+3. Execute unified pgvector similarity query:
+   SELECT * FROM embeddings e
+   LEFT JOIN observations/patterns/concepts/documents
    ORDER BY e.embedding <=> query_embedding
-4. Return results with similarity scores
-5. Update access_count and last_accessed
+4. Return results with similarity scores and source_type discriminator
+5. Update access_count and last_accessed for matched source types
 ```
 
 ---
@@ -550,6 +554,35 @@ Currently no CASCADE deletes configured. Consider:
 
 ---
 
+## Canonical Invariants
+
+Core principles that guide system behavior and future development:
+
+1. **Embedding Source Text:**
+   - `observations.observation` is the canonical text that gets embedded
+   - `patterns.pattern_text` for patterns
+   - `concepts.description` for concepts
+   - `documents.content_summary` for documents
+
+2. **Multi-Model Support:**
+   - `embeddings` table may contain multiple vectors per entity (by model_version)
+   - Allows gradual model upgrades without data loss
+
+3. **Optional Provenance:**
+   - `sessions` are optional provenance; observations can exist without sessions
+   - Enables both conversational and non-conversational data storage
+
+4. **Best-Effort Metrics:**
+   - Access metrics (`access_count`, `last_accessed`) are best-effort and may lag under failures
+   - Not used for critical business logic
+
+5. **No Automatic Cascades:**
+   - No cascading deletes configured
+   - Deletion requires explicit cleanup to prevent accidental data loss
+   - Polymorphic relationships maintained in application logic
+
+---
+
 ## Future Enhancements
 
 ### Planned Schema Changes
@@ -572,4 +605,4 @@ Currently no CASCADE deletes configured. Consider:
 
 **Last Updated:** January 2, 2026  
 **Schema Version:** 0.1.0  
-**Database:** PostgreSQL 17.7 + pgvector
+**Database:** PostgreSQL 15/16/17 (Fly managed) + pgvector

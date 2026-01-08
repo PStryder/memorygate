@@ -5,6 +5,7 @@ Handles OAuth 2.0 authentication flow
 """
 
 import os
+import secrets
 from typing import Optional
 from datetime import datetime
 
@@ -284,7 +285,7 @@ async def client_credentials_auth(
             detail="Invalid client credentials"
         )
     
-    if request.client_secret != expected_client_secret:
+    if not secrets.compare_digest(request.client_secret, expected_client_secret):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid client credentials"

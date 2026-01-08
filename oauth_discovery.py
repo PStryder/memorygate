@@ -341,7 +341,7 @@ async def oauth_authorize_post(
     )
     
     # Verify client secret
-    if client_secret != OAUTH_CLIENT_SECRET:
+    if not secrets.compare_digest(client_secret, OAUTH_CLIENT_SECRET):
         raise HTTPException(status_code=401, detail="Invalid client secret")
     
     # Clean up expired codes
@@ -412,7 +412,7 @@ async def oauth_token(request: Request):
     if client_id != OAUTH_CLIENT_ID:
         raise HTTPException(status_code=401, detail="Invalid client_id")
     
-    if client_secret and client_secret != OAUTH_CLIENT_SECRET:
+    if client_secret and not secrets.compare_digest(client_secret, OAUTH_CLIENT_SECRET):
         raise HTTPException(status_code=401, detail="Invalid client_secret")
     
     # Validate required fields

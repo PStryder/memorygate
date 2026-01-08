@@ -17,16 +17,15 @@ import os
 import secrets
 import hashlib
 import base64
-import time
 from typing import Dict, Any, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timedelta
 from string import Template
 
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
-from oauth_models import APIKey, User
+from oauth_models import APIKey, User, OAuthAuthorizationCode
 from auth_middleware import hash_api_key, generate_api_key
 
 
@@ -46,19 +45,13 @@ OAUTH_ALLOWED_REDIRECT_URIS = [
 AUTH_CODE_TTL_SECONDS = 60  # Auth codes expire in 60 seconds
 
 # =============================================================================
-# In-Memory Storage (ephemeral, single-instance)
+# Database-backed auth codes (multi-instance safe)
 # =============================================================================
-
-AUTH_CODES: Dict[str, Dict[str, Any]] = {}
 
 
 # =============================================================================
 # Helpers
 # =============================================================================
-
-def _now() -> int:
-    return int(time.time())
-
 
 def _b64url(data: bytes) -> str:
     """URL-safe base64 encoding without padding"""
@@ -71,12 +64,21 @@ def pkce_s256_challenge(verifier: str) -> str:
     return _b64url(digest)
 
 
-def clean_expired_auth_codes() -> None:
+def _get_db_session() -> Session:
+    from server import DB
+    if DB.SessionLocal is None:
+        raise HTTPException(status_code=503, detail="Database not initialized")
+    return DB.SessionLocal()
+
+
+def clean_expired_auth_codes(db: Session, commit: bool = True) -> None:
     """Remove expired authorization codes"""
-    now = _now()
-    expired = [code for code, meta in AUTH_CODES.items() if meta.get("exp", 0) <= now]
-    for code in expired:
-        AUTH_CODES.pop(code, None)
+    cutoff = datetime.utcnow()
+    db.query(OAuthAuthorizationCode).filter(
+        OAuthAuthorizationCode.expires_at <= cutoff
+    ).delete()
+    if commit:
+        db.commit()
 
 
 def require_oauth_env() -> None:
@@ -356,19 +358,26 @@ async def oauth_authorize_post(
     if not secrets.compare_digest(client_secret, OAUTH_CLIENT_SECRET):
         raise HTTPException(status_code=401, detail="Invalid client secret")
     
-    # Clean up expired codes
-    clean_expired_auth_codes()
-    
-    # Generate authorization code
-    code = secrets.token_urlsafe(32)
-    AUTH_CODES[code] = {
-        "client_id": meta["client_id"],
-        "redirect_uri": meta["redirect_uri"],
-        "scope": meta["scope"],
-        "code_challenge": meta["code_challenge"],
-        "exp": _now() + AUTH_CODE_TTL_SECONDS,
-        "state": meta["state"],
-    }
+    db = _get_db_session()
+    try:
+        # Clean up expired codes
+        clean_expired_auth_codes(db)
+
+        # Generate authorization code
+        code = secrets.token_urlsafe(32)
+        auth_code = OAuthAuthorizationCode(
+            code=code,
+            client_id=meta["client_id"],
+            redirect_uri=meta["redirect_uri"],
+            scope=meta["scope"],
+            code_challenge=meta["code_challenge"],
+            state=meta["state"],
+            expires_at=datetime.utcnow() + timedelta(seconds=AUTH_CODE_TTL_SECONDS),
+        )
+        db.add(auth_code)
+        db.commit()
+    finally:
+        db.close()
     
     # Redirect back to client with code
     sep = "&" if "?" in meta["redirect_uri"] else "?"
@@ -434,28 +443,42 @@ async def oauth_token(request: Request):
             detail="Missing required fields: code, redirect_uri, code_verifier"
         )
     
-    # Clean up expired codes
-    clean_expired_auth_codes()
-    
-    # Retrieve and validate authorization code
-    meta = AUTH_CODES.pop(code, None)
-    if not meta:
-        raise HTTPException(status_code=400, detail="Invalid or expired authorization code")
-    
-    if redirect_uri != meta["redirect_uri"]:
-        raise HTTPException(status_code=400, detail="redirect_uri mismatch")
-    
-    # Verify PKCE challenge
-    if pkce_s256_challenge(code_verifier) != meta["code_challenge"]:
-        raise HTTPException(status_code=400, detail="PKCE verification failed")
-    
-    # Create API key in database
-    from server import DB
-    if DB.SessionLocal is None:
-        raise HTTPException(status_code=503, detail="Database not initialized")
-    
-    db = DB.SessionLocal()
+    db = _get_db_session()
     try:
+        # Clean up expired codes
+        clean_expired_auth_codes(db, commit=False)
+
+        # Retrieve and validate authorization code (one-time use)
+        auth_code = (
+            db.query(OAuthAuthorizationCode)
+            .filter(OAuthAuthorizationCode.code == code)
+            .with_for_update()
+            .first()
+        )
+        if not auth_code:
+            raise HTTPException(status_code=400, detail="Invalid or expired authorization code")
+
+        meta = {
+            "client_id": auth_code.client_id,
+            "redirect_uri": auth_code.redirect_uri,
+            "scope": auth_code.scope,
+            "code_challenge": auth_code.code_challenge,
+            "state": auth_code.state,
+        }
+        is_expired = auth_code.is_expired
+        db.delete(auth_code)
+        db.commit()
+
+        if is_expired:
+            raise HTTPException(status_code=400, detail="Invalid or expired authorization code")
+
+        if redirect_uri != meta["redirect_uri"]:
+            raise HTTPException(status_code=400, detail="redirect_uri mismatch")
+
+        # Verify PKCE challenge
+        if pkce_s256_challenge(code_verifier) != meta["code_challenge"]:
+            raise HTTPException(status_code=400, detail="PKCE verification failed")
+
         # Find or create user for this client
         user = db.query(User).filter(
             User.email == f"{client_id}@client.memorygate.internal"

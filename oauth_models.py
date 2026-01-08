@@ -85,6 +85,25 @@ class OAuthState(Base):
         return datetime.utcnow() > self.expires_at
 
 
+class OAuthAuthorizationCode(Base):
+    """Short-lived authorization codes for PKCE flow."""
+    __tablename__ = "oauth_authorization_codes"
+
+    code = Column(String, primary_key=True)
+    client_id = Column(String, nullable=False)
+    redirect_uri = Column(String, nullable=False)
+    scope = Column(String, nullable=False)
+    code_challenge = Column(String, nullable=False)
+    state = Column(String, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    expires_at = Column(DateTime, nullable=False)
+
+    @property
+    def is_expired(self) -> bool:
+        return datetime.utcnow() > self.expires_at
+
+
 class UserSession(Base):
     """Active user sessions"""
     __tablename__ = "user_sessions"

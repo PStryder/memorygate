@@ -1,0 +1,41 @@
+version: "3.9"
+
+services:
+  memorygate:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      DB_BACKEND: postgres
+      VECTOR_BACKEND: pgvector
+      DATABASE_URL: postgresql://memorygate:memorygate@postgres:5432/memorygate
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-openai}
+      OAUTH_REDIRECT_BASE: http://localhost:8080
+      FRONTEND_URL: http://localhost:3000
+      REQUIRE_MCP_AUTH: "false"
+      AUTO_MIGRATE_ON_STARTUP: "false"
+      RATE_LIMIT_REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - postgres
+      - redis
+    command: ["migrate-and-serve"]
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: memorygate
+      POSTGRES_PASSWORD: memorygate
+      POSTGRES_DB: memorygate
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_data:

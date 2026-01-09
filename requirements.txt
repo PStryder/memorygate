@@ -10,7 +10,7 @@ python-dotenv
 psycopg2-binary
 sqlalchemy
 alembic
-pgvector
+# Postgres/pgvector extras live in requirements-postgres.txt
 
 # HTTP client for OpenAI
 httpx

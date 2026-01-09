@@ -52,13 +52,20 @@ from retention import (
 # Configuration
 # =============================================================================
 
+DB_BACKEND = os.environ.get("DB_BACKEND", "postgres").strip().lower()
+VECTOR_BACKEND = os.environ.get("VECTOR_BACKEND", "pgvector").strip().lower()
+SQLITE_PATH = os.environ.get("SQLITE_PATH", "/data/memorygate.db")
+
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL environment variable is required")
+    if DB_BACKEND == "sqlite":
+        if not SQLITE_PATH:
+            raise RuntimeError("SQLITE_PATH environment variable is required for sqlite")
+        DATABASE_URL = f"sqlite:///{SQLITE_PATH}"
+    else:
+        raise RuntimeError("DATABASE_URL environment variable is required")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY environment variable is required")
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_DIM = 1536
@@ -160,18 +167,38 @@ rate_limiter = build_rate_limiter_from_env(rate_limit_config)
 request_size_config = load_request_size_limit_config_from_env()
 security_headers_config = load_security_headers_config_from_env()
 
+if DB_BACKEND not in {"postgres", "sqlite"}:
+    raise RuntimeError("DB_BACKEND must be 'postgres' or 'sqlite'")
+
+if VECTOR_BACKEND not in {"pgvector", "sqlite_vss", "none"}:
+    raise RuntimeError("VECTOR_BACKEND must be 'pgvector', 'sqlite_vss', or 'none'")
+
+if DB_BACKEND == "sqlite" and VECTOR_BACKEND == "pgvector":
+    raise RuntimeError("VECTOR_BACKEND=pgvector requires DB_BACKEND=postgres")
+
+if DB_BACKEND == "postgres" and VECTOR_BACKEND == "sqlite_vss":
+    raise RuntimeError("VECTOR_BACKEND=sqlite_vss requires DB_BACKEND=sqlite")
+
 if TENANCY_MODE != "single":
     raise RuntimeError(
         "Only single-tenant mode is supported. Set MEMORYGATE_TENANCY_MODE=single."
     )
 
-if EMBEDDING_PROVIDER not in {"openai", "local_cpd"}:
+if EMBEDDING_PROVIDER not in {"openai", "local_cpd", "none"}:
     raise RuntimeError(
-        "Unknown EMBEDDING_PROVIDER. Use 'openai' or 'local_cpd'."
+        "Unknown EMBEDDING_PROVIDER. Use 'openai', 'local_cpd', or 'none'."
     )
+
+if EMBEDDING_PROVIDER == "openai" and not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY environment variable is required")
 
 if FORGET_MODE not in {"soft", "hard"}:
     raise RuntimeError("FORGET_MODE must be 'soft' or 'hard'")
+
+VECTOR_BACKEND_EFFECTIVE = VECTOR_BACKEND
+if VECTOR_BACKEND == "sqlite_vss":
+    VECTOR_BACKEND_EFFECTIVE = "none"
+    logger.warning("VECTOR_BACKEND=sqlite_vss is not configured; falling back to keyword search.")
 
 # =============================================================================
 # Global State
@@ -236,13 +263,13 @@ def _ensure_schema_up_to_date(engine) -> None:
 def init_http_client():
     """Initialize HTTP client for OpenAI API calls."""
     global http_client
+    headers = {"Content-Type": "application/json"}
+    if OPENAI_API_KEY:
+        headers["Authorization"] = f"Bearer {OPENAI_API_KEY}"
     http_client = httpx.Client(
         timeout=httpx.Timeout(EMBEDDING_TIMEOUT_SECONDS),
         limits=httpx.Limits(max_keepalive_connections=10, max_connections=100),
-        headers={
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json"
-        }
+        headers=headers,
     )
     logger.info("HTTP client initialized")
 
@@ -472,17 +499,20 @@ def init_db():
     """Initialize database connection and create tables."""
     
     logger.info("Connecting to database...")
-    DB.engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    engine_kwargs = {"pool_pre_ping": True}
+    if DB_BACKEND == "sqlite":
+        engine_kwargs["connect_args"] = {"check_same_thread": False}
+    DB.engine = create_engine(DATABASE_URL, **engine_kwargs)
     DB.SessionLocal = sessionmaker(bind=DB.engine)
     
     # FIRST: Ensure pgvector extension exists (optional)
-    if AUTO_CREATE_EXTENSIONS:
+    if AUTO_CREATE_EXTENSIONS and DB_BACKEND == "postgres" and VECTOR_BACKEND_EFFECTIVE == "pgvector":
         logger.info("Ensuring pgvector extension...")
         with DB.engine.connect() as conn:
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
             conn.commit()
     else:
-        logger.info("Skipping pgvector extension creation (AUTO_CREATE_EXTENSIONS=false)")
+        logger.info("Skipping pgvector extension creation")
     
     # Import OAuth models to register tables with Base
     import oauth_models  # noqa: F401
@@ -513,6 +543,8 @@ async def _embed_text_local_cpd_async(text: str) -> List[float]:
 async def embed_text(text: str) -> List[float]:
     """Generate embedding using configured provider."""
     _validate_embedding_text(text)
+    if EMBEDDING_PROVIDER == "none":
+        _raise_embedding_unavailable("embedding provider disabled")
     if EMBEDDING_PROVIDER == "local_cpd":
         return await _embed_text_local_cpd_async(text)
     if embedding_circuit_breaker.is_open():
@@ -562,6 +594,8 @@ async def embed_text(text: str) -> List[float]:
 def embed_text_sync(text: str) -> List[float]:
     """Synchronous version of embed_text using pooled HTTP client."""
     _validate_embedding_text(text)
+    if EMBEDDING_PROVIDER == "none":
+        _raise_embedding_unavailable("embedding provider disabled")
     if EMBEDDING_PROVIDER == "local_cpd":
         return _embed_text_local_cpd_sync(text)
     if embedding_circuit_breaker.is_open():
@@ -614,6 +648,36 @@ def _embed_or_raise(text: str) -> List[float]:
             status_code=503,
             detail="embedding provider unavailable",
         ) from exc
+
+
+def _vector_search_enabled() -> bool:
+    return DB_BACKEND == "postgres" and VECTOR_BACKEND_EFFECTIVE == "pgvector"
+
+
+def _store_embedding(
+    db,
+    source_type: str,
+    source_id: int,
+    text_value: str,
+    replace: bool = False,
+) -> None:
+    if not _vector_search_enabled():
+        return
+    embedding_vector = _embed_or_raise(text_value)
+    if replace:
+        db.query(Embedding).filter(
+            Embedding.source_type == source_type,
+            Embedding.source_id == source_id,
+        ).delete()
+    emb = Embedding(
+        source_type=source_type,
+        source_id=source_id,
+        model_version=EMBEDDING_MODEL,
+        embedding=embedding_vector,
+        normalized=True,
+    )
+    db.add(emb)
+    db.commit()
 
 
 # =============================================================================
@@ -986,6 +1050,19 @@ def _search_memory_impl(
     include_evidence: bool = True,
     bump_score: bool = True,
 ) -> dict:
+    if not _vector_search_enabled():
+        return _search_memory_keyword_impl(
+            query=query,
+            limit=limit,
+            min_confidence=min_confidence,
+            domain=domain,
+            tier_filter=tier_filter,
+            min_score=min_score,
+            max_score=max_score,
+            include_evidence=include_evidence,
+            bump_score=bump_score,
+        )
+
     db = DB.SessionLocal()
     try:
         query_embedding = _embed_or_raise(query)
@@ -1161,6 +1238,139 @@ def _search_memory_impl(
     finally:
         db.close()
 
+
+def _search_memory_keyword_impl(
+    query: str,
+    limit: int,
+    min_confidence: float,
+    domain: Optional[str],
+    tier_filter: Optional[MemoryTier],
+    min_score: Optional[float],
+    max_score: Optional[float],
+    include_evidence: bool,
+    bump_score: bool,
+) -> dict:
+    db = DB.SessionLocal()
+    try:
+        pattern = f"%{query}%"
+        candidates: list[tuple[str, object]] = []
+
+        def add_candidates(
+            model,
+            source_type: str,
+            content_attr: str,
+            timestamp_attr: str,
+        ) -> None:
+            query_builder = db.query(model)
+            if tier_filter is not None:
+                query_builder = query_builder.filter(model.tier == tier_filter)
+            if min_score is not None:
+                query_builder = query_builder.filter(model.score >= min_score)
+            if max_score is not None:
+                query_builder = query_builder.filter(model.score <= max_score)
+            if source_type in {"observation", "pattern"} and min_confidence > 0:
+                query_builder = query_builder.filter(model.confidence >= min_confidence)
+            if source_type == "observation" and domain:
+                query_builder = query_builder.filter(model.domain == domain)
+
+            content_column = getattr(model, content_attr)
+            query_builder = query_builder.filter(content_column.ilike(pattern))
+            query_builder = query_builder.order_by(desc(getattr(model, timestamp_attr)))
+            rows = query_builder.limit(limit).all()
+            for row in rows:
+                candidates.append((source_type, row))
+
+        add_candidates(Observation, "observation", "observation", "timestamp")
+        add_candidates(Pattern, "pattern", "pattern_text", "last_updated")
+        add_candidates(Concept, "concept", "description", "created_at")
+        add_candidates(Document, "document", "content_summary", "created_at")
+
+        def candidate_timestamp(item: tuple[str, object]) -> float:
+            source_type, row = item
+            if source_type == "observation":
+                ts = row.timestamp
+            elif source_type == "pattern":
+                ts = row.last_updated
+            elif source_type == "concept":
+                ts = row.created_at
+            else:
+                ts = row.created_at
+            return ts.timestamp() if ts else 0.0
+
+        candidates.sort(key=candidate_timestamp, reverse=True)
+        selected = candidates[:limit]
+
+        if bump_score:
+            for source_type, row in selected:
+                if row.tier == MemoryTier.hot:
+                    _apply_fetch_bump(row, SCORE_BUMP_ALPHA)
+            db.commit()
+
+        results = []
+        for source_type, row in selected:
+            if source_type == "observation":
+                content = row.observation
+                confidence = row.confidence
+                domain_or_category = row.domain
+                timestamp = row.timestamp
+                metadata = row.evidence
+                ai_name = row.ai_instance.name if row.ai_instance else None
+                session_title = row.session.title if row.session else None
+                item_name = None
+            elif source_type == "pattern":
+                content = row.pattern_text
+                confidence = row.confidence
+                domain_or_category = row.category
+                timestamp = row.last_updated
+                metadata = row.evidence_observation_ids
+                ai_name = row.ai_instance.name if row.ai_instance else None
+                session_title = row.session.title if row.session else None
+                item_name = row.pattern_name
+            elif source_type == "concept":
+                content = row.description
+                confidence = 1.0
+                domain_or_category = row.domain
+                timestamp = row.created_at
+                metadata = row.metadata_
+                ai_name = row.ai_instance.name if row.ai_instance else None
+                session_title = None
+                item_name = row.name
+            else:
+                content = row.content_summary
+                confidence = 1.0
+                domain_or_category = row.doc_type
+                timestamp = row.created_at
+                metadata = row.key_concepts
+                ai_name = None
+                session_title = None
+                item_name = row.title
+
+            results.append(
+                {
+                    "source_type": source_type,
+                    "id": row.id,
+                    "content": content,
+                    "snippet": (content or "")[:200],
+                    "name": item_name,
+                    "confidence": confidence,
+                    "domain": domain_or_category,
+                    "timestamp": timestamp.isoformat() if timestamp else None,
+                    "metadata": metadata if include_evidence else None,
+                    "ai_name": ai_name,
+                    "session_title": session_title,
+                    "similarity": 0.0,
+                    "score": float(row.score) if row.score is not None else None,
+                    "tier": row.tier.value if isinstance(row.tier, MemoryTier) else row.tier,
+                }
+            )
+
+        return {
+            "query": query,
+            "count": len(results),
+            "results": results,
+        }
+    finally:
+        db.close()
 @mcp.tool()
 def memory_search(
     query: str,
@@ -1724,17 +1934,8 @@ def memory_store(
         db.commit()
         db.refresh(obs)
         
-        # Generate and store embedding
-        embedding_vector = _embed_or_raise(observation)
-        emb = Embedding(
-            source_type="observation",
-            source_id=obs.id,
-            model_version=EMBEDDING_MODEL,
-            embedding=embedding_vector,
-            normalized=True
-        )
-        db.add(emb)
-        db.commit()
+        # Generate and store embedding (if enabled)
+        _store_embedding(db, "observation", obs.id, observation)
         
         return {
             "status": "stored",
@@ -2004,17 +2205,8 @@ def memory_store_document(
         db.commit()
         db.refresh(doc)
         
-        # Generate and store embedding from summary
-        embedding_vector = _embed_or_raise(content_summary)
-        emb = Embedding(
-            source_type="document",
-            source_id=doc.id,
-            model_version=EMBEDDING_MODEL,
-            embedding=embedding_vector,
-            normalized=True
-        )
-        db.add(emb)
-        db.commit()
+        # Generate and store embedding from summary (if enabled)
+        _store_embedding(db, "document", doc.id, content_summary)
         
         return {
             "status": "stored",
@@ -2098,17 +2290,8 @@ def memory_store_concept(
         db.commit()
         db.refresh(concept)
         
-        # Generate and store embedding from description
-        embedding_vector = _embed_or_raise(description)
-        emb = Embedding(
-            source_type="concept",
-            source_id=concept.id,
-            model_version=EMBEDDING_MODEL,
-            embedding=embedding_vector,
-            normalized=True
-        )
-        db.add(emb)
-        db.commit()
+        # Generate and store embedding from description (if enabled)
+        _store_embedding(db, "concept", concept.id, description)
         
         return {
             "status": "stored",
@@ -2498,25 +2681,8 @@ def memory_update_pattern(
             db.commit()
             db.refresh(existing)
             
-            # Update embedding
-            embedding_vector = _embed_or_raise(pattern_text)
-            
-            # Delete old embedding
-            db.query(Embedding).filter(
-                Embedding.source_type == 'pattern',
-                Embedding.source_id == existing.id
-            ).delete()
-            
-            # Create new embedding
-            emb = Embedding(
-                source_type="pattern",
-                source_id=existing.id,
-                model_version=EMBEDDING_MODEL,
-                embedding=embedding_vector,
-                normalized=True
-            )
-            db.add(emb)
-            db.commit()
+            # Update embedding (if enabled)
+            _store_embedding(db, "pattern", existing.id, pattern_text, replace=True)
             
             return {
                 "status": "updated",
@@ -2540,17 +2706,8 @@ def memory_update_pattern(
             db.commit()
             db.refresh(pattern)
             
-            # Generate and store embedding
-            embedding_vector = _embed_or_raise(pattern_text)
-            emb = Embedding(
-                source_type="pattern",
-                source_id=pattern.id,
-                model_version=EMBEDDING_MODEL,
-                embedding=embedding_vector,
-                normalized=True
-            )
-            db.add(emb)
-            db.commit()
+            # Generate and store embedding (if enabled)
+            _store_embedding(db, "pattern", pattern.id, pattern_text)
             
             return {
                 "status": "created",
@@ -3099,9 +3256,13 @@ def _check_db_health() -> dict:
     try:
         with DB.engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-            ext_version = conn.execute(
-                text("SELECT extversion FROM pg_extension WHERE extname = 'vector'")
-            ).scalar()
+            ext_version = None
+            pgvector_installed = True
+            if DB_BACKEND == "postgres" and VECTOR_BACKEND_EFFECTIVE == "pgvector":
+                ext_version = conn.execute(
+                    text("SELECT extversion FROM pg_extension WHERE extname = 'vector'")
+                ).scalar()
+                pgvector_installed = bool(ext_version)
     except Exception as exc:
         return {"ok": False, "error": str(exc)}
 
@@ -3109,7 +3270,7 @@ def _check_db_health() -> dict:
     schema_ok = head_rev is None or current_rev == head_rev
     return {
         "ok": schema_ok,
-        "pgvector_installed": bool(ext_version),
+        "pgvector_installed": pgvector_installed,
         "pgvector_version": ext_version,
         "schema_revision": current_rev,
         "schema_expected": head_rev,
@@ -3130,7 +3291,8 @@ app.include_router(auth_router)
 async def health():
     """Health check endpoint."""
     db_health = _check_db_health()
-    if not db_health.get("ok") or not db_health.get("pgvector_installed"):
+    vector_required = DB_BACKEND == "postgres" and VECTOR_BACKEND_EFFECTIVE == "pgvector"
+    if not db_health.get("ok") or (vector_required and not db_health.get("pgvector_installed")):
         raise HTTPException(status_code=503, detail=db_health)
 
     return {
@@ -3147,7 +3309,8 @@ async def health():
 async def health_deps():
     """Dependency health checks (optional embedding provider probe)."""
     db_health = _check_db_health()
-    if not db_health.get("ok") or not db_health.get("pgvector_installed"):
+    vector_required = DB_BACKEND == "postgres" and VECTOR_BACKEND_EFFECTIVE == "pgvector"
+    if not db_health.get("ok") or (vector_required and not db_health.get("pgvector_installed")):
         raise HTTPException(status_code=503, detail={"database": db_health})
 
     breaker_status = embedding_circuit_breaker.status()
@@ -3158,7 +3321,9 @@ async def health_deps():
         "checked": False,
     }
 
-    if breaker_status.get("open"):
+    if EMBEDDING_PROVIDER == "none":
+        embedding_status["status"] = "disabled"
+    elif breaker_status.get("open"):
         embedding_status["status"] = "cooldown"
     elif EMBEDDING_HEALTHCHECK_ENABLED:
         embedding_status["checked"] = True

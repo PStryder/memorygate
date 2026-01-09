@@ -9,7 +9,7 @@ Last Updated: January 2, 2026
 
 ## Overview
 
-MemoryGate uses PostgreSQL with the pgvector extension for vector similarity search. All tables use SQLAlchemy ORM models defined in `models.py`. The schema supports:
+MemoryGate uses PostgreSQL with the pgvector extension for vector similarity search. All tables use SQLAlchemy ORM models defined in `models.py`. SQLite mode stores JSON in place of JSONB and can disable vector search. The schema supports:
 
 - AI instance tracking (multiple AI personalities)
 - Session/conversation provenance

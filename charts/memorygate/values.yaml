@@ -1,0 +1,80 @@
+replicaCount: 1
+
+image:
+  repository: memorygate
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+env:
+  DB_BACKEND: postgres
+  VECTOR_BACKEND: pgvector
+  AUTO_MIGRATE_ON_STARTUP: "false"
+  EMBEDDING_PROVIDER: openai
+  EMBEDDING_HEALTHCHECK_ENABLED: "true"
+  RATE_LIMIT_ENABLED: "true"
+  REQUEST_SIZE_LIMIT_ENABLED: "true"
+  MEMORYGATE_TENANCY_MODE: single
+
+secrets:
+  databaseUrl: ""
+  openaiApiKey: ""
+  oauthRedirectBase: ""
+  frontendUrl: ""
+  pstryderDesktop: ""
+  pstryderDesktopSecret: ""
+  githubClientId: ""
+  githubClientSecret: ""
+  googleClientId: ""
+  googleClientSecret: ""
+
+migrations:
+  enabled: true
+  args:
+    - migrate
+
+podSecurityContext:
+  fsGroup: 10001
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+
+resources: {}
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+ingress:
+  enabled: false
+  className: ""
+  hosts:
+    - host: memorygate.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+
+persistence:
+  enabled: false
+  storageClassName: ""
+  accessModes:
+    - ReadWriteOnce
+  size: 10Gi
+  mountPath: /data
+
+networkPolicy:
+  enabled: false

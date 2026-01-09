@@ -13,7 +13,20 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-database_url = os.environ.get("DATABASE_URL")
+def _resolve_database_url() -> str | None:
+    database_url = os.environ.get("DATABASE_URL")
+    if database_url:
+        return database_url
+    db_backend = os.environ.get("DB_BACKEND", "postgres").strip().lower()
+    if db_backend == "sqlite":
+        sqlite_path = os.environ.get("SQLITE_PATH", "/data/memorygate.db")
+        if not sqlite_path:
+            raise RuntimeError("SQLITE_PATH is required for sqlite migrations")
+        return f"sqlite:///{sqlite_path}"
+    return None
+
+
+database_url = _resolve_database_url()
 if database_url:
     config.set_main_option("sqlalchemy.url", database_url)
 

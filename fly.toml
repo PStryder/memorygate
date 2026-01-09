@@ -18,9 +18,11 @@ primary_region = "iad"
   path = "/health"
   timeout = "10s"
 
-[mounts]
-  source = "data_volume"
-  destination = "/data"
+[env]
+  AUTO_MIGRATE_ON_STARTUP = "false"
+
+[deploy]
+  release_command = "alembic upgrade head"
 
 [[vm]]
   memory = "2gb"

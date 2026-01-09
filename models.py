@@ -5,14 +5,38 @@ PostgreSQL + pgvector schema
 
 from datetime import datetime
 from enum import Enum as PyEnum
+import os
 import uuid
 from sqlalchemy import (
     Column, Integer, BigInteger, String, Text, Float, Boolean,
-    DateTime, ForeignKey, CheckConstraint, Index, UniqueConstraint, Enum
+    DateTime, ForeignKey, CheckConstraint, Index, UniqueConstraint, Enum, JSON
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship, declarative_base
-from pgvector.sqlalchemy import Vector
+
+DB_BACKEND = os.environ.get("DB_BACKEND", "postgres").strip().lower()
+VECTOR_BACKEND = os.environ.get("VECTOR_BACKEND", "pgvector").strip().lower()
+
+if DB_BACKEND not in {"postgres", "sqlite"}:
+    raise RuntimeError("DB_BACKEND must be 'postgres' or 'sqlite'")
+if VECTOR_BACKEND not in {"pgvector", "sqlite_vss", "none"}:
+    raise RuntimeError("VECTOR_BACKEND must be 'pgvector', 'sqlite_vss', or 'none'")
+if DB_BACKEND == "sqlite" and VECTOR_BACKEND == "pgvector":
+    raise RuntimeError("VECTOR_BACKEND=pgvector requires DB_BACKEND=postgres")
+if DB_BACKEND == "postgres" and VECTOR_BACKEND == "sqlite_vss":
+    raise RuntimeError("VECTOR_BACKEND=sqlite_vss requires DB_BACKEND=sqlite")
+
+EMBEDDING_COLUMN_TYPE = None
+if DB_BACKEND == "postgres" and VECTOR_BACKEND == "pgvector":
+    try:
+        from pgvector.sqlalchemy import Vector as PgVector
+    except ImportError as exc:
+        raise RuntimeError("pgvector is required when VECTOR_BACKEND=pgvector") from exc
+    EMBEDDING_COLUMN_TYPE = PgVector(1536)
+else:
+    EMBEDDING_COLUMN_TYPE = JSON
+
+JSON_TYPE = JSONB if DB_BACKEND == "postgres" else JSON
 
 Base = declarative_base()
 
@@ -67,7 +91,7 @@ class Session(Base):
     started_at = Column(DateTime(timezone=True), default=datetime.utcnow)
     last_active = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
     summary = Column(Text)
-    metadata_ = Column("metadata", JSONB, default=dict)
+    metadata_ = Column("metadata", JSON_TYPE, default=dict)
     
     # Relationships
     ai_instance = relationship("AIInstance", back_populates="sessions")
@@ -87,7 +111,7 @@ class Observation(Base):
     observation = Column(Text, nullable=False)
     confidence = Column(Float, default=0.8)
     domain = Column(String(100))
-    evidence = Column(JSONB, default=list)
+    evidence = Column(JSON_TYPE, default=list)
     
     # Provenance
     session_id = Column(Integer, ForeignKey("sessions.id"))
@@ -132,7 +156,7 @@ class Pattern(Base):
     pattern_text = Column(Text, nullable=False)
     confidence = Column(Float, default=0.8)
     last_updated = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
-    evidence_observation_ids = Column(JSONB, default=list)
+    evidence_observation_ids = Column(JSON_TYPE, default=list)
     
     # Provenance
     session_id = Column(Integer, ForeignKey("sessions.id"))
@@ -177,7 +201,7 @@ class Concept(Base):
     status = Column(String(50))
     domain = Column(String(100))
     description = Column(Text)  # Used for embedding
-    metadata_ = Column("metadata", JSONB, default=dict)
+    metadata_ = Column("metadata", JSON_TYPE, default=dict)
     
     # Provenance
     ai_instance_id = Column(Integer, ForeignKey("ai_instances.id"))
@@ -252,8 +276,8 @@ class Document(Base):
     content_summary = Column(Text)
     url = Column(String(1000))
     publication_date = Column(DateTime(timezone=True))
-    key_concepts = Column(JSONB, default=list)
-    metadata_ = Column("metadata", JSONB, default=dict)
+    key_concepts = Column(JSON_TYPE, default=list)
+    metadata_ = Column("metadata", JSON_TYPE, default=dict)
     
     # Access tracking
     access_count = Column(BigInteger, default=0, nullable=False)
@@ -285,9 +309,9 @@ class MemorySummary(Base):
     id = Column(Integer, primary_key=True)
     source_type = Column(String(50), nullable=False)
     source_id = Column(Integer, nullable=True)
-    source_ids = Column(JSONB, default=list)
+    source_ids = Column(JSON_TYPE, default=list)
     summary_text = Column(Text, nullable=False)
-    metadata_ = Column("metadata", JSONB, default=dict)
+    metadata_ = Column("metadata", JSON_TYPE, default=dict)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
 
     # Access tracking
@@ -325,7 +349,7 @@ class MemoryTombstone(Base):
     reason = Column(Text)
     actor = Column(String(100))
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
-    metadata_ = Column("metadata", JSONB, default=dict)
+    metadata_ = Column("metadata", JSON_TYPE, default=dict)
 
     __table_args__ = (
         Index('ix_memory_tombstones_memory_id', 'memory_id'),
@@ -343,7 +367,7 @@ class Embedding(Base):
     source_type = Column(String(50), primary_key=True)  # observation/pattern/concept/document
     source_id = Column(Integer, primary_key=True)
     model_version = Column(String(100), primary_key=True, default="all-MiniLM-L6-v2")
-    embedding = Column(Vector(1536), nullable=False)  # OpenAI text-embedding-3-small
+    embedding = Column(EMBEDDING_COLUMN_TYPE, nullable=False)  # OpenAI text-embedding-3-small
     normalized = Column(Boolean, default=True)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
     

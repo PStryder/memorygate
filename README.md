@@ -431,6 +431,8 @@ fly secrets set \
 # Deploy
 fly deploy
 
+# Migrations run via Fly release_command (alembic upgrade head)
+
 # Health check
 curl https://memorygate.fly.dev/health
 ```
@@ -440,6 +442,8 @@ curl https://memorygate.fly.dev/health
 ```bash
 # Install dependencies
 pip install -r requirements.txt
+# For Postgres + pgvector support
+pip install -r requirements-postgres.txt
 
 # Set environment
 export DATABASE_URL="postgresql://localhost/memorygate"
@@ -485,6 +489,34 @@ python server.py
 curl http://localhost:8080/mcp/
 ```
 
+SQLite mode (no pgvector, keyword search fallback):
+
+```bash
+export DB_BACKEND="sqlite"
+export VECTOR_BACKEND="none"
+export SQLITE_PATH="./memorygate.db"
+export EMBEDDING_PROVIDER="none"
+unset DATABASE_URL
+```
+
+### Docker (Local)
+
+```bash
+# Build and run with migrations
+docker compose up --build
+
+# Run migrations only
+docker run --rm memorygate:latest migrate
+```
+
+### Kubernetes (Helm)
+
+```bash
+helm install memorygate charts/memorygate \
+  --set secrets.databaseUrl="postgresql://..." \
+  --set secrets.openaiApiKey="sk-..."
+```
+
 ### Database Setup
 
 PostgreSQL 13+ with pgvector extension:
@@ -495,12 +527,15 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 Server validates the schema on startup and expects Alembic migrations to be applied.
 
+SQLite can be used for local/single-user deployments with `DB_BACKEND=sqlite` and `VECTOR_BACKEND=none`.
+
 ### Production Hardening Notes
 
 - This is **single-tenant**: all authenticated keys/users share the same data by design.
 - The server enforces `MEMORYGATE_TENANCY_MODE=single`; any other value fails startup.
 - Use Alembic migrations to manage schema changes (`alembic revision --autogenerate -m "..."`, then `alembic upgrade head`).
 - `AUTO_MIGRATE_ON_STARTUP` defaults to true; set it to false before production so schema drift fails fast.
+- Prefer running migrations explicitly (Fly release_command, K8s initContainer, or `entrypoint.sh migrate`).
 - Enable security headers and HSTS for HTTPS deployments (`SECURITY_HEADERS_*`).
 - Configure trusted proxies before honoring `X-Forwarded-For` (`RATE_LIMIT_TRUSTED_PROXY_COUNT` or `RATE_LIMIT_TRUSTED_PROXY_IPS`).
 - Adjust request limits (`MAX_REQUEST_BODY_BYTES`, `MEMORYGATE_MAX_*`) based on your traffic profile.

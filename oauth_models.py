@@ -6,13 +6,18 @@ Extends existing models.py with authentication tables.
 
 from datetime import datetime, timedelta
 from typing import Optional
-from sqlalchemy import Column, String, DateTime, Boolean, Integer, ForeignKey, Index
-from sqlalchemy.orm import relationship
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+import os
 import uuid
 import secrets
 
+from sqlalchemy import Column, String, DateTime, Boolean, Integer, ForeignKey, Index, JSON
+from sqlalchemy.orm import relationship
+from sqlalchemy.dialects.postgresql import UUID, JSONB
+
 from models import Base  # Import existing Base
+
+DB_BACKEND = os.environ.get("DB_BACKEND", "postgres").strip().lower()
+JSON_TYPE = JSONB if DB_BACKEND == "postgres" else JSON
 
 
 class User(Base):
@@ -38,7 +43,7 @@ class User(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     # Metadata storage for provider-specific data
-    metadata_ = Column("metadata", JSONB, default=dict, nullable=False)
+    metadata_ = Column("metadata", JSON_TYPE, default=dict, nullable=False)
     
     # Relationships
     api_keys = relationship("APIKey", back_populates="user", cascade="all, delete-orphan")
@@ -65,7 +70,7 @@ class OAuthState(Base):
     code_verifier = Column(String, nullable=True)
     
     # Metadata for state restoration
-    metadata_ = Column("metadata", JSONB, default=dict, nullable=False)
+    metadata_ = Column("metadata", JSON_TYPE, default=dict, nullable=False)
     
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     expires_at = Column(DateTime, nullable=False)
@@ -117,7 +122,7 @@ class UserSession(Base):
     # Session metadata
     ip_address = Column(String, nullable=True)
     user_agent = Column(String, nullable=True)
-    metadata_ = Column("metadata", JSONB, default=dict, nullable=False)
+    metadata_ = Column("metadata", JSON_TYPE, default=dict, nullable=False)
     
     # Expiry
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -165,7 +170,7 @@ class APIKey(Base):
     
     # Key metadata
     name = Column(String, nullable=False)  # User-provided name
-    scopes = Column(JSONB, default=list, nullable=False)  # Permission scopes
+    scopes = Column(JSON_TYPE, default=list, nullable=False)  # Permission scopes
     
     # Usage tracking
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)

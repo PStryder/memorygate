@@ -40,8 +40,9 @@ Currently operational on Fly.io with OpenAI embeddings (text-embedding-3-small, 
 - **Documents** - References to external content (Google Drive canonical)
 - **Relationships** - Graph edges connecting concepts
 - **Semantic Search** - Unified vector search across all types
+- **Cold Storage** - Hot/cold tiers with archiving, rehydration, and tombstones
 
-### 16 MCP Tools Available
+### 20 MCP Tools Available
 
 **Session Management (1):**
 - `memory_init_session()` - Initialize conversation with AI instance tracking
@@ -70,6 +71,12 @@ Currently operational on Fly.io with OpenAI embeddings (text-embedding-3-small, 
 
 **Telemetry (1):**
 - `memory_stats()` - System health and usage statistics
+
+**Cold Storage (4):**
+- `search_cold_memory()` - Explicit cold tier search
+- `archive_memory()` - Archive hot records to cold (dry-run safe)
+- `rehydrate_memory()` - Rehydrate cold records to hot
+- `list_archive_candidates()` - Preview hot candidates below score
 
 ---
 
@@ -201,7 +208,7 @@ observations       -- Main data storage
 ├─ id, timestamp, observation, confidence
 ├─ domain, evidence (JSONB)
 ├─ session_id (FK), ai_instance_id (FK)
-├─ access_count, last_accessed
+├─ access_count, last_accessed_at, tier, score
 
 embeddings         -- Unified vector storage
 ├─ source_type (observation/pattern/concept/document)
@@ -232,6 +239,15 @@ documents          -- External content references
 ├─ id, title, doc_type, url (Google Drive)
 ├─ content_summary (embedded), key_concepts
 ├─ publication_date, metadata
+  access_count, last_accessed_at, tier, score
+
+memory_summaries   -- Summaries for archived records
+  id, source_type, source_id, summary_text
+  tier, score, archived_at
+
+memory_tombstones  -- Audit trail for archive/rehydrate/purge
+  id, memory_id, action, from_tier, to_tier
+
 
 users              -- OAuth users
 ├─ id, email, oauth_provider, oauth_subject
@@ -250,7 +266,22 @@ All text content is embedded using OpenAI's `text-embedding-3-small` (1536 dimen
 - Concept descriptions
 - Document summaries
 
-Single `memory_search()` call queries across all types simultaneously with pgvector cosine similarity.
+Single `memory_search()` call queries across all types simultaneously with pgvector cosine similarity. It defaults to hot-tier data; use `include_cold=true` or `search_cold_memory()` for cold data.
+
+## Cold Storage Lifecycle
+
+- Hot tier is the default for normal retrieval.
+- Scores decay over time; below -1 triggers summarize-and-archive, below -2 marks purge eligible (soft) or deletes if hard purge is allowed.
+- Tombstones record archive, rehydrate, purge, and summarize actions.
+- Cold search does not bump score unless `bump_score=true`.
+
+### Tool Set Summary (for Claude)
+
+- search_memory (hot-only default)
+- search_cold_memory (explicit cold search)
+- archive_memory (archive hot records, dry-run safe)
+- rehydrate_memory (move cold records back to hot)
+- list_archive_candidates (preview archive targets)
 
 ---
 
@@ -275,7 +306,7 @@ memory_store(
     observation="Completed OAuth 2.0 + PKCE integration",
     confidence=0.95,
     domain="technical_milestone",
-    evidence=["Deployment successful", "All 16 tools working"]
+    evidence=["Deployment successful", "All 20 tools working"]
 )
 ```
 
@@ -439,11 +470,12 @@ export EMBEDDING_RETRY_BACKOFF_SECONDS="0.5"
 export EMBEDDING_RETRY_JITTER_SECONDS="0.25"
 export EMBEDDING_FAILURE_THRESHOLD="5"
 export EMBEDDING_COOLDOWN_SECONDS="60"
-# export EMBEDDING_HEALTHCHECK_ENABLED="true"
+export EMBEDDING_HEALTHCHECK_ENABLED="true"
+# export EMBEDDING_PROVIDER="openai"
 # export SECURITY_HEADERS_ENABLE_HSTS="true"
 # export TRUSTED_HOSTS="memorygate.ai,localhost"
 export MEMORYGATE_TENANCY_MODE="single"
-# export AUTO_MIGRATE_ON_STARTUP="true"
+export AUTO_MIGRATE_ON_STARTUP="true"
 
 # Run server
 python server.py
@@ -468,11 +500,13 @@ Server validates the schema on startup and expects Alembic migrations to be appl
 - This is **single-tenant**: all authenticated keys/users share the same data by design.
 - The server enforces `MEMORYGATE_TENANCY_MODE=single`; any other value fails startup.
 - Use Alembic migrations to manage schema changes (`alembic revision --autogenerate -m "..."`, then `alembic upgrade head`).
-- `AUTO_MIGRATE_ON_STARTUP=true` is intended for dev only; production should fail fast if schema drifts.
+- `AUTO_MIGRATE_ON_STARTUP` defaults to true; set it to false before production so schema drift fails fast.
 - Enable security headers and HSTS for HTTPS deployments (`SECURITY_HEADERS_*`).
 - Configure trusted proxies before honoring `X-Forwarded-For` (`RATE_LIMIT_TRUSTED_PROXY_COUNT` or `RATE_LIMIT_TRUSTED_PROXY_IPS`).
 - Adjust request limits (`MAX_REQUEST_BODY_BYTES`, `MEMORYGATE_MAX_*`) based on your traffic profile.
+- Tune cold storage controls (`RETENTION_*`, `FORGET_MODE`, `COLD_SEARCH_ENABLED`) based on retention goals.
 - `/health` checks DB connectivity and pgvector; `/health/deps` can optionally probe embeddings.
+- `EMBEDDING_PROVIDER=local_cpd` is stubbed for local embeddings; see `server.py` for the sentence-transformers wiring comment.
 
 ---
 
@@ -517,7 +551,7 @@ Server validates the schema on startup and expects Alembic migrations to be appl
 ## 🗺️ Roadmap
 
 ### v0.1.0 (Current) ✅
-- [x] 16 MCP tools (session, storage, retrieval, graph, docs)
+- [x] 20 MCP tools (session, storage, retrieval, graph, docs, cold storage)
 - [x] OAuth 2.0 + PKCE authentication
 - [x] Self-documentation (bootstrap + user guide)
 - [x] PostgreSQL + pgvector storage

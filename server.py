@@ -20,13 +20,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastmcp import FastMCP
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from sqlalchemy import create_engine, text, func, desc
+from sqlalchemy import create_engine, text, func, desc, case, and_, or_
 from sqlalchemy.orm import sessionmaker
 import numpy as np
 
 from models import (
     Base, AIInstance, Session, Observation, Pattern, 
-    Concept, ConceptAlias, ConceptRelationship, Document, Embedding
+    Concept, ConceptAlias, ConceptRelationship, Document, Embedding,
+    MemorySummary, MemoryTombstone, MemoryTier, TombstoneAction
 )
 from oauth_models import cleanup_expired_sessions, cleanup_expired_states
 from rate_limiter import (
@@ -39,6 +40,12 @@ from security_middleware import (
     SecurityHeadersMiddleware,
     load_request_size_limit_config_from_env,
     load_security_headers_config_from_env,
+)
+from retention import (
+    apply_fetch_bump,
+    apply_decay_tick,
+    clamp_score,
+    apply_floor,
 )
 
 # =============================================================================
@@ -88,7 +95,7 @@ def _get_float(env_name: str, default: float) -> float:
 
 # Database initialization controls
 AUTO_CREATE_EXTENSIONS = _get_bool("AUTO_CREATE_EXTENSIONS", True)
-AUTO_MIGRATE_ON_STARTUP = _get_bool("AUTO_MIGRATE_ON_STARTUP", False)
+AUTO_MIGRATE_ON_STARTUP = _get_bool("AUTO_MIGRATE_ON_STARTUP", True)
 
 # Tenancy mode (single tenant only for now)
 TENANCY_MODE = os.environ.get("MEMORYGATE_TENANCY_MODE", "single").strip().lower()
@@ -119,7 +126,31 @@ EMBEDDING_RETRY_BACKOFF_SECONDS = _get_float("EMBEDDING_RETRY_BACKOFF_SECONDS", 
 EMBEDDING_RETRY_JITTER_SECONDS = _get_float("EMBEDDING_RETRY_JITTER_SECONDS", 0.25)
 EMBEDDING_FAILURE_THRESHOLD = _get_int("EMBEDDING_FAILURE_THRESHOLD", 5)
 EMBEDDING_COOLDOWN_SECONDS = _get_int("EMBEDDING_COOLDOWN_SECONDS", 60)
-EMBEDDING_HEALTHCHECK_ENABLED = _get_bool("EMBEDDING_HEALTHCHECK_ENABLED", False)
+EMBEDDING_HEALTHCHECK_ENABLED = _get_bool("EMBEDDING_HEALTHCHECK_ENABLED", True)
+EMBEDDING_PROVIDER = os.environ.get("EMBEDDING_PROVIDER", "openai").strip().lower()
+
+# Retention & scoring
+SCORE_BUMP_ALPHA = _get_float("SCORE_BUMP_ALPHA", 0.4)
+REHYDRATE_BUMP_ALPHA = _get_float("REHYDRATE_BUMP_ALPHA", 0.2)
+SCORE_DECAY_BETA = _get_float("SCORE_DECAY_BETA", 0.02)
+SCORE_CLAMP_MIN = _get_float("SCORE_CLAMP_MIN", -3.0)
+SCORE_CLAMP_MAX = _get_float("SCORE_CLAMP_MAX", 1.0)
+SUMMARY_TRIGGER_SCORE = _get_float("SUMMARY_TRIGGER_SCORE", -1.0)
+PURGE_TRIGGER_SCORE = _get_float("PURGE_TRIGGER_SCORE", -2.0)
+RETENTION_PRESSURE = _get_float("RETENTION_PRESSURE", 1.0)
+RETENTION_BUDGET = _get_int("RETENTION_BUDGET", 100000)
+RETENTION_TICK_SECONDS = _get_int("RETENTION_TICK_SECONDS", 900)
+COLD_DECAY_MULTIPLIER = _get_float("COLD_DECAY_MULTIPLIER", 0.25)
+FORGET_MODE = os.environ.get("FORGET_MODE", "soft").strip().lower()
+COLD_SEARCH_ENABLED = _get_bool("COLD_SEARCH_ENABLED", True)
+ARCHIVE_LIMIT_DEFAULT = _get_int("ARCHIVE_LIMIT_DEFAULT", 200)
+ARCHIVE_LIMIT_MAX = _get_int("ARCHIVE_LIMIT_MAX", 500)
+REHYDRATE_LIMIT_MAX = _get_int("REHYDRATE_LIMIT_MAX", 200)
+TOMBSTONES_ENABLED = _get_bool("TOMBSTONES_ENABLED", True)
+SUMMARY_MAX_LENGTH = _get_int("SUMMARY_MAX_LENGTH", 800)
+SUMMARY_BATCH_LIMIT = _get_int("SUMMARY_BATCH_LIMIT", 100)
+RETENTION_PURGE_LIMIT = _get_int("RETENTION_PURGE_LIMIT", 100)
+ALLOW_HARD_PURGE_WITHOUT_SUMMARY = _get_bool("ALLOW_HARD_PURGE_WITHOUT_SUMMARY", False)
 
 # Rate limiting configuration (optional Redis backend)
 rate_limit_config = load_rate_limit_config_from_env()
@@ -134,6 +165,14 @@ if TENANCY_MODE != "single":
         "Only single-tenant mode is supported. Set MEMORYGATE_TENANCY_MODE=single."
     )
 
+if EMBEDDING_PROVIDER not in {"openai", "local_cpd"}:
+    raise RuntimeError(
+        "Unknown EMBEDDING_PROVIDER. Use 'openai' or 'local_cpd'."
+    )
+
+if FORGET_MODE not in {"soft", "hard"}:
+    raise RuntimeError("FORGET_MODE must be 'soft' or 'hard'")
+
 # =============================================================================
 # Global State
 # =============================================================================
@@ -145,6 +184,7 @@ class DB:
 
 http_client = None  # Reusable HTTP client for OpenAI API
 cleanup_task = None  # Background cleanup loop
+retention_task = None  # Background retention loop
 
 
 def _get_alembic_config():
@@ -237,6 +277,197 @@ async def _cleanup_loop() -> None:
             logger.warning(f"Cleanup task error: {exc}")
 
 
+async def _retention_loop() -> None:
+    if RETENTION_TICK_SECONDS <= 0:
+        return
+    while True:
+        await asyncio.sleep(RETENTION_TICK_SECONDS)
+        try:
+            _run_retention_tick()
+        except Exception as exc:
+            logger.warning(f"Retention task error: {exc}")
+
+
+def _summarize_and_archive(db) -> dict:
+    archived = 0
+    summaries_created = 0
+    reason = "auto_summarize"
+    for mem_type, model in MEMORY_MODELS.items():
+        records = (
+            db.query(model)
+            .filter(model.tier == MemoryTier.hot)
+            .filter(model.score <= SUMMARY_TRIGGER_SCORE)
+            .order_by(model.score.asc())
+            .limit(SUMMARY_BATCH_LIMIT)
+            .all()
+        )
+        for record in records:
+            summary_text = _summary_text_for_record(mem_type, record)
+            if not summary_text:
+                continue
+            summary = _find_summary_for_source(db, mem_type, record.id)
+            if summary:
+                summary.summary_text = summary_text
+            else:
+                summary = MemorySummary(
+                    source_type=mem_type,
+                    source_id=record.id,
+                    source_ids=[record.id],
+                    summary_text=summary_text,
+                    metadata_={"reason": reason},
+                )
+                db.add(summary)
+                summaries_created += 1
+            _write_tombstone(
+                db,
+                _serialize_memory_id(mem_type, record.id),
+                TombstoneAction.summarized,
+                from_tier=record.tier,
+                to_tier=record.tier,
+                reason=reason,
+                actor="system",
+            )
+            record.tier = MemoryTier.cold
+            record.archived_at = datetime.utcnow()
+            record.archived_reason = reason
+            record.archived_by = "system"
+            record.purge_eligible = False
+            _write_tombstone(
+                db,
+                _serialize_memory_id(mem_type, record.id),
+                TombstoneAction.archived,
+                from_tier=MemoryTier.hot,
+                to_tier=MemoryTier.cold,
+                reason=reason,
+                actor="system",
+            )
+            archived += 1
+
+    db.commit()
+    return {"archived": archived, "summaries_created": summaries_created}
+
+
+def _purge_cold_records(db) -> dict:
+    purged = 0
+    marked = 0
+    for mem_type, model in MEMORY_MODELS.items():
+        records = (
+            db.query(model)
+            .filter(model.tier == MemoryTier.cold)
+            .filter(model.score <= PURGE_TRIGGER_SCORE)
+            .order_by(model.score.asc())
+            .limit(RETENTION_PURGE_LIMIT)
+            .all()
+        )
+        for record in records:
+            if FORGET_MODE == "soft":
+                record.purge_eligible = True
+                _write_tombstone(
+                    db,
+                    _serialize_memory_id(mem_type, record.id),
+                    TombstoneAction.purged,
+                    from_tier=MemoryTier.cold,
+                    to_tier=MemoryTier.cold,
+                    reason="soft_purge_marked",
+                    actor="system",
+                    metadata={"mode": "soft"},
+                )
+                marked += 1
+                continue
+
+            summary = _find_summary_for_source(db, mem_type, record.id)
+            if summary is None and not ALLOW_HARD_PURGE_WITHOUT_SUMMARY:
+                continue
+
+            db.query(Embedding).filter(
+                Embedding.source_type == mem_type,
+                Embedding.source_id == record.id
+            ).delete()
+            db.delete(record)
+            _write_tombstone(
+                db,
+                _serialize_memory_id(mem_type, record.id),
+                TombstoneAction.purged,
+                from_tier=MemoryTier.cold,
+                to_tier=None,
+                reason="hard_purge",
+                actor="system",
+                metadata={"mode": "hard"},
+            )
+            purged += 1
+
+    # Purge summaries
+    summaries = (
+        db.query(MemorySummary)
+        .filter(MemorySummary.tier == MemoryTier.cold)
+        .filter(MemorySummary.score <= PURGE_TRIGGER_SCORE)
+        .order_by(MemorySummary.score.asc())
+        .limit(RETENTION_PURGE_LIMIT)
+        .all()
+    )
+    for summary in summaries:
+        if FORGET_MODE == "soft":
+            summary.purge_eligible = True
+            _write_tombstone(
+                db,
+                f"summary:{summary.id}",
+                TombstoneAction.purged,
+                from_tier=MemoryTier.cold,
+                to_tier=MemoryTier.cold,
+                reason="soft_purge_marked",
+                actor="system",
+                metadata={"mode": "soft"},
+            )
+            marked += 1
+            continue
+
+        db.delete(summary)
+        _write_tombstone(
+            db,
+            f"summary:{summary.id}",
+            TombstoneAction.purged,
+            from_tier=MemoryTier.cold,
+            to_tier=None,
+            reason="hard_purge",
+            actor="system",
+            metadata={"mode": "hard"},
+        )
+        purged += 1
+
+    db.commit()
+    return {"purged": purged, "marked": marked}
+
+
+def _run_retention_tick() -> None:
+    if DB.SessionLocal is None:
+        return
+    db = DB.SessionLocal()
+    try:
+        pressure = _calculate_pressure_multiplier(db)
+        hot_updates = 0
+        cold_updates = 0
+        for model in MEMORY_MODELS.values():
+            hot_updates += _apply_decay_to_model(db, model, MemoryTier.hot, pressure, 1.0)
+            cold_updates += _apply_decay_to_model(db, model, MemoryTier.cold, pressure, COLD_DECAY_MULTIPLIER)
+        hot_updates += _apply_decay_to_model(db, MemorySummary, MemoryTier.hot, pressure, 1.0)
+        cold_updates += _apply_decay_to_model(db, MemorySummary, MemoryTier.cold, pressure, COLD_DECAY_MULTIPLIER)
+        db.commit()
+
+        summary_stats = _summarize_and_archive(db)
+        purge_stats = _purge_cold_records(db)
+        logger.info(
+            "Retention tick complete",
+            extra={
+                "decayed_hot": hot_updates,
+                "decayed_cold": cold_updates,
+                **summary_stats,
+                **purge_stats,
+            },
+        )
+    finally:
+        db.close()
+
+
 def init_db():
     """Initialize database connection and create tables."""
     
@@ -262,9 +493,28 @@ def init_db():
     logger.info("Database initialized")
 
 
+def _embed_text_local_cpd_sync(text: str) -> List[float]:
+    """
+    Stub for local CPD embeddings (CPU).
+
+    To enable, install sentence-transformers and replace this stub:
+      - pip install sentence-transformers
+      - from sentence_transformers import SentenceTransformer
+      - model = SentenceTransformer("all-MiniLM-L6-v2")
+      - return model.encode([text])[0].tolist()
+    """
+    _raise_embedding_unavailable("local_cpd embedding not configured")
+
+
+async def _embed_text_local_cpd_async(text: str) -> List[float]:
+    return await asyncio.to_thread(_embed_text_local_cpd_sync, text)
+
+
 async def embed_text(text: str) -> List[float]:
-    """Generate embedding using OpenAI API."""
+    """Generate embedding using configured provider."""
     _validate_embedding_text(text)
+    if EMBEDDING_PROVIDER == "local_cpd":
+        return await _embed_text_local_cpd_async(text)
     if embedding_circuit_breaker.is_open():
         _raise_embedding_unavailable("circuit breaker open")
     timeout = httpx.Timeout(EMBEDDING_TIMEOUT_SECONDS)
@@ -312,6 +562,8 @@ async def embed_text(text: str) -> List[float]:
 def embed_text_sync(text: str) -> List[float]:
     """Synchronous version of embed_text using pooled HTTP client."""
     _validate_embedding_text(text)
+    if EMBEDDING_PROVIDER == "local_cpd":
+        return _embed_text_local_cpd_sync(text)
     if embedding_circuit_breaker.is_open():
         _raise_embedding_unavailable("circuit breaker open")
     global http_client
@@ -352,6 +604,16 @@ def embed_text_sync(text: str) -> List[float]:
         data = response.json()
         embedding_circuit_breaker.record_success()
         return data["data"][0]["embedding"]
+
+
+def _embed_or_raise(text: str) -> List[float]:
+    try:
+        return embed_text_sync(text)
+    except EmbeddingProviderError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="embedding provider unavailable",
+        ) from exc
 
 
 # =============================================================================
@@ -489,6 +751,179 @@ async def _async_sleep_backoff(attempt: int) -> None:
     base = EMBEDDING_RETRY_BACKOFF_SECONDS * (2 ** attempt)
     jitter = random.uniform(0, EMBEDDING_RETRY_JITTER_SECONDS)
     await asyncio.sleep(base + jitter)
+
+
+def _apply_fetch_bump(record, alpha: float) -> None:
+    record.access_count = (record.access_count or 0) + 1
+    record.last_accessed_at = datetime.utcnow()
+    bumped = apply_fetch_bump(record.score, alpha, bump_clamp_min=-2.0, bump_clamp_max=1.0)
+    bumped = clamp_score(bumped, SCORE_CLAMP_MIN, SCORE_CLAMP_MAX)
+    record.score = apply_floor(bumped, record.floor_score)
+
+
+def _apply_rehydrate_bump(record) -> None:
+    bumped = apply_fetch_bump(record.score, REHYDRATE_BUMP_ALPHA, bump_clamp_min=-2.0, bump_clamp_max=1.0)
+    bumped = clamp_score(bumped, SCORE_CLAMP_MIN, SCORE_CLAMP_MAX)
+    record.score = apply_floor(bumped, record.floor_score)
+
+
+def _serialize_memory_id(memory_type: str, memory_id: int) -> str:
+    return f"{memory_type}:{memory_id}"
+
+
+def _write_tombstone(
+    db,
+    memory_id: str,
+    action: TombstoneAction,
+    from_tier: Optional[MemoryTier],
+    to_tier: Optional[MemoryTier],
+    reason: Optional[str],
+    actor: Optional[str],
+    metadata: Optional[dict] = None,
+) -> None:
+    if not TOMBSTONES_ENABLED:
+        return
+    tombstone = MemoryTombstone(
+        memory_id=memory_id,
+        action=action,
+        from_tier=from_tier,
+        to_tier=to_tier,
+        reason=reason,
+        actor=actor,
+        metadata_=metadata or {},
+    )
+    db.add(tombstone)
+
+
+def _summary_text_for_record(memory_type: str, record) -> str:
+    if memory_type == "observation":
+        source = record.observation
+    elif memory_type == "pattern":
+        source = record.pattern_text
+    elif memory_type == "concept":
+        source = record.description or ""
+    elif memory_type == "document":
+        source = record.content_summary or ""
+    else:
+        source = ""
+    source = source.strip()
+    return source[:SUMMARY_MAX_LENGTH]
+
+
+def _calculate_pressure_multiplier(db) -> float:
+    total = (
+        db.query(func.count(Observation.id)).scalar()
+        + db.query(func.count(Pattern.id)).scalar()
+        + db.query(func.count(Concept.id)).scalar()
+        + db.query(func.count(Document.id)).scalar()
+        + db.query(func.count(MemorySummary.id)).scalar()
+    )
+    budget = max(1, RETENTION_BUDGET)
+    multiplier = RETENTION_PRESSURE * (total / budget)
+    return max(1.0, multiplier)
+
+
+def _apply_decay_to_model(db, model, tier: MemoryTier, pressure_multiplier: float, decay_multiplier: float) -> int:
+    beta = SCORE_DECAY_BETA * decay_multiplier
+    if beta <= 0:
+        return 0
+    score_expr = model.score - beta * pressure_multiplier
+    clamped = case(
+        (score_expr < SCORE_CLAMP_MIN, SCORE_CLAMP_MIN),
+        (score_expr > SCORE_CLAMP_MAX, SCORE_CLAMP_MAX),
+        else_=score_expr,
+    )
+    floored = case(
+        (clamped < model.floor_score, model.floor_score),
+        else_=clamped,
+    )
+    result = (
+        db.query(model)
+        .filter(model.tier == tier)
+        .update({model.score: floored}, synchronize_session=False)
+    )
+    return result or 0
+
+
+def _find_summary_for_source(db, memory_type: str, source_id: int) -> Optional[MemorySummary]:
+    return db.query(MemorySummary).filter(
+        MemorySummary.source_type == memory_type,
+        MemorySummary.source_id == source_id
+    ).first()
+
+
+def _parse_memory_ref(raw) -> tuple[str, int]:
+    if isinstance(raw, int):
+        return "observation", raw
+    if isinstance(raw, str):
+        value = raw.strip()
+        if ":" in value:
+            mem_type, mem_id = value.split(":", 1)
+            return mem_type.strip().lower(), int(mem_id)
+        return "observation", int(value)
+    raise ValueError("memory_ids must be int or 'type:id' string")
+
+
+def _collect_records_by_refs(db, refs: list[tuple[str, int]]) -> list[tuple[str, object]]:
+    records = []
+    for mem_type, mem_id in refs:
+        model = MEMORY_MODELS.get(mem_type)
+        if not model:
+            raise ValueError(f"Unknown memory type: {mem_type}")
+        record = db.query(model).filter(model.id == mem_id).first()
+        if record:
+            records.append((mem_type, record))
+    return records
+
+
+def _collect_threshold_records(
+    db,
+    tier: MemoryTier,
+    below_score: Optional[float],
+    above_score: Optional[float],
+    types: list[str],
+    limit: int,
+) -> list[tuple[str, object]]:
+    candidates: list[tuple[str, object]] = []
+    for mem_type in types:
+        model = MEMORY_MODELS.get(mem_type)
+        if not model:
+            continue
+        query = db.query(model).filter(model.tier == tier)
+        if below_score is not None:
+            query = query.filter(model.score <= below_score)
+        if above_score is not None:
+            query = query.filter(model.score >= above_score)
+        if below_score is not None:
+            query = query.order_by(model.score.asc())
+        elif above_score is not None:
+            query = query.order_by(model.score.desc())
+        rows = query.limit(limit).all()
+        for row in rows:
+            candidates.append((mem_type, row))
+
+    if below_score is not None:
+        candidates.sort(key=lambda item: item[1].score)
+    elif above_score is not None:
+        candidates.sort(key=lambda item: item[1].score, reverse=True)
+    return candidates[:limit]
+
+
+def _collect_summary_threshold_records(
+    db,
+    tier: MemoryTier,
+    below_score: Optional[float],
+    above_score: Optional[float],
+    limit: int,
+) -> list[MemorySummary]:
+    query = db.query(MemorySummary).filter(MemorySummary.tier == tier)
+    if below_score is not None:
+        query = query.filter(MemorySummary.score <= below_score)
+        query = query.order_by(MemorySummary.score.asc())
+    if above_score is not None:
+        query = query.filter(MemorySummary.score >= above_score)
+        query = query.order_by(MemorySummary.score.desc())
+    return query.limit(limit).all()
 def get_or_create_ai_instance(db, name: str, platform: str) -> AIInstance:
     """Get or create an AI instance by name."""
     instance = db.query(AIInstance).filter(AIInstance.name == name).first()
@@ -532,38 +967,29 @@ def get_or_create_session(
 
 mcp = FastMCP("MemoryGate")
 
+MEMORY_MODELS = {
+    "observation": Observation,
+    "pattern": Pattern,
+    "concept": Concept,
+    "document": Document,
+}
 
-@mcp.tool()
-def memory_search(
+
+def _search_memory_impl(
     query: str,
-    limit: int = 5,
-    min_confidence: float = 0.0,
-    domain: Optional[str] = None
+    limit: int,
+    min_confidence: float,
+    domain: Optional[str],
+    tier_filter: Optional[MemoryTier],
+    min_score: Optional[float] = None,
+    max_score: Optional[float] = None,
+    include_evidence: bool = True,
+    bump_score: bool = True,
 ) -> dict:
-    """
-    Unified semantic search across all memory types (observations, patterns, concepts, documents).
-    
-    Args:
-        query: Search query text
-        limit: Maximum results to return (default 5)
-        min_confidence: Minimum confidence threshold (0.0-1.0)
-        domain: Optional domain filter (applies to observations only)
-    
-    Returns:
-        List of matching items from all sources with similarity scores and source_type
-    """
-    _validate_required_text(query, "query", MAX_QUERY_LENGTH)
-    _validate_limit(limit, "limit", MAX_RESULT_LIMIT)
-    _validate_confidence(min_confidence, "min_confidence")
-    _validate_optional_text(domain, "domain", MAX_DOMAIN_LENGTH)
-
     db = DB.SessionLocal()
     try:
-        # Generate query embedding
-        query_embedding = embed_text_sync(query)
-        
-        # Unified search across all embedded types
-        # Note: pgvector's cast() handles vector conversion natively
+        query_embedding = _embed_or_raise(query)
+
         sql = text("""
             SELECT 
                 e.source_type,
@@ -597,6 +1023,18 @@ def memory_search(
                     WHEN e.source_type = 'concept' THEN c.metadata
                     WHEN e.source_type = 'document' THEN d.key_concepts
                 END as metadata,
+                CASE 
+                    WHEN e.source_type = 'observation' THEN o.score
+                    WHEN e.source_type = 'pattern' THEN p.score
+                    WHEN e.source_type = 'concept' THEN c.score
+                    WHEN e.source_type = 'document' THEN d.score
+                END as score,
+                CASE 
+                    WHEN e.source_type = 'observation' THEN o.tier
+                    WHEN e.source_type = 'pattern' THEN p.tier
+                    WHEN e.source_type = 'concept' THEN c.tier
+                    WHEN e.source_type = 'document' THEN d.tier
+                END as tier,
                 CASE 
                     WHEN e.source_type = 'observation' THEN obs_ai.name
                     WHEN e.source_type = 'pattern' THEN pat_ai.name
@@ -636,41 +1074,67 @@ def memory_search(
                 :domain IS NULL 
                 OR (e.source_type = 'observation' AND o.domain = :domain)
             )
+            AND (
+                :tier IS NULL
+                OR (e.source_type = 'observation' AND o.tier = :tier)
+                OR (e.source_type = 'pattern' AND p.tier = :tier)
+                OR (e.source_type = 'concept' AND c.tier = :tier)
+                OR (e.source_type = 'document' AND d.tier = :tier)
+            )
+            AND (
+                :min_score IS NULL
+                OR (
+                    CASE 
+                        WHEN e.source_type = 'observation' THEN o.score
+                        WHEN e.source_type = 'pattern' THEN p.score
+                        WHEN e.source_type = 'concept' THEN c.score
+                        WHEN e.source_type = 'document' THEN d.score
+                    END >= :min_score
+                )
+            )
+            AND (
+                :max_score IS NULL
+                OR (
+                    CASE 
+                        WHEN e.source_type = 'observation' THEN o.score
+                        WHEN e.source_type = 'pattern' THEN p.score
+                        WHEN e.source_type = 'concept' THEN c.score
+                        WHEN e.source_type = 'document' THEN d.score
+                    END <= :max_score
+                )
+            )
             ORDER BY e.embedding <=> cast(:embedding as vector)
             LIMIT :limit
         """)
-        
+
         results = db.execute(sql, {
-            "embedding": str(query_embedding),  # pgvector handles list conversion
+            "embedding": str(query_embedding),
             "min_confidence": min_confidence,
             "domain": domain,
-            "limit": limit
+            "limit": limit,
+            "tier": tier_filter.value if tier_filter else None,
+            "min_score": min_score,
+            "max_score": max_score,
         }).fetchall()
-        
-        # Update access counts for each source type
-        for row in results:
-            if row.source_type == 'observation':
-                db.execute(
-                    text("UPDATE observations SET access_count = access_count + 1, last_accessed = NOW() WHERE id = :id"),
-                    {"id": row.source_id}
-                )
-            elif row.source_type == 'pattern':
-                db.execute(
-                    text("UPDATE patterns SET access_count = access_count + 1, last_accessed = NOW() WHERE id = :id"),
-                    {"id": row.source_id}
-                )
-            elif row.source_type == 'concept':
-                db.execute(
-                    text("UPDATE concepts SET access_count = access_count + 1, last_accessed = NOW() WHERE id = :id"),
-                    {"id": row.source_id}
-                )
-            elif row.source_type == 'document':
-                db.execute(
-                    text("UPDATE documents SET access_count = access_count + 1, last_accessed = NOW() WHERE id = :id"),
-                    {"id": row.source_id}
-                )
-        db.commit()
-        
+
+        if bump_score:
+            for row in results:
+                if row.tier != MemoryTier.hot.value:
+                    continue
+                if row.source_type == 'observation':
+                    record = db.query(Observation).filter(Observation.id == row.source_id).first()
+                elif row.source_type == 'pattern':
+                    record = db.query(Pattern).filter(Pattern.id == row.source_id).first()
+                elif row.source_type == 'concept':
+                    record = db.query(Concept).filter(Concept.id == row.source_id).first()
+                elif row.source_type == 'document':
+                    record = db.query(Document).filter(Document.id == row.source_id).first()
+                else:
+                    record = None
+                if record:
+                    _apply_fetch_bump(record, SCORE_BUMP_ALPHA)
+            db.commit()
+
         return {
             "query": query,
             "count": len(results),
@@ -679,17 +1143,521 @@ def memory_search(
                     "source_type": row.source_type,
                     "id": row.source_id,
                     "content": row.content,
+                    "snippet": (row.content or "")[:200],
                     "name": row.item_name,
                     "confidence": row.confidence,
                     "domain": row.domain_or_category,
                     "timestamp": row.timestamp.isoformat() if row.timestamp else None,
-                    "metadata": row.metadata,
+                    "metadata": row.metadata if include_evidence else None,
                     "ai_name": row.ai_name,
                     "session_title": row.session_title,
-                    "similarity": float(row.similarity)
+                    "similarity": float(row.similarity),
+                    "score": float(row.score) if row.score is not None else None,
+                    "tier": row.tier,
                 }
                 for row in results
             ]
+        }
+    finally:
+        db.close()
+
+@mcp.tool()
+def memory_search(
+    query: str,
+    limit: int = 5,
+    min_confidence: float = 0.0,
+    domain: Optional[str] = None,
+    include_cold: bool = False
+) -> dict:
+    """
+    Unified semantic search across all memory types (observations, patterns, concepts, documents).
+    
+    Args:
+        query: Search query text
+        limit: Maximum results to return (default 5)
+        min_confidence: Minimum confidence threshold (0.0-1.0)
+        domain: Optional domain filter (applies to observations only)
+        include_cold: Include cold tier records
+    
+    Returns:
+        List of matching items from all sources with similarity scores and source_type
+    """
+    _validate_required_text(query, "query", MAX_QUERY_LENGTH)
+    _validate_limit(limit, "limit", MAX_RESULT_LIMIT)
+    _validate_confidence(min_confidence, "min_confidence")
+    _validate_optional_text(domain, "domain", MAX_DOMAIN_LENGTH)
+
+    tier_filter = None if include_cold else MemoryTier.hot
+    return _search_memory_impl(
+        query=query,
+        limit=limit,
+        min_confidence=min_confidence,
+        domain=domain,
+        tier_filter=tier_filter,
+        include_evidence=True,
+        bump_score=True,
+    )
+
+
+@mcp.tool()
+def search_cold_memory(
+    query: str,
+    top_k: int = 10,
+    min_score: Optional[float] = None,
+    max_score: Optional[float] = None,
+    type_filter: Optional[str] = None,
+    source: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    include_evidence: bool = True,
+    bump_score: bool = False
+) -> dict:
+    """
+    Explicit search over cold-tier memory records.
+    """
+    if not COLD_SEARCH_ENABLED:
+        return {"status": "error", "message": "Cold search is disabled"}
+
+    _validate_required_text(query, "query", MAX_QUERY_LENGTH)
+    _validate_limit(top_k, "top_k", 50)
+    _validate_optional_text(type_filter, "type_filter", MAX_SHORT_TEXT_LENGTH)
+    _validate_optional_text(source, "source", MAX_SHORT_TEXT_LENGTH)
+    _validate_string_list(tags, "tags", MAX_LIST_ITEMS, MAX_LIST_ITEM_LENGTH)
+
+    dt_from = None
+    dt_to = None
+    if date_from:
+        _validate_optional_text(date_from, "date_from", MAX_SHORT_TEXT_LENGTH)
+        dt_from = datetime.fromisoformat(date_from.replace("Z", "+00:00"))
+    if date_to:
+        _validate_optional_text(date_to, "date_to", MAX_SHORT_TEXT_LENGTH)
+        dt_to = datetime.fromisoformat(date_to.replace("Z", "+00:00"))
+
+    fetch_limit = min(max(top_k * 5, top_k), MAX_RESULT_LIMIT)
+    results = _search_memory_impl(
+        query=query,
+        limit=fetch_limit,
+        min_confidence=0.0,
+        domain=None,
+        tier_filter=MemoryTier.cold,
+        min_score=min_score,
+        max_score=max_score,
+        include_evidence=include_evidence or bool(tags),
+        bump_score=bump_score,
+    )
+
+    filtered = []
+    for row in results["results"]:
+        if type_filter and row["source_type"] != type_filter:
+            continue
+        if source and row.get("ai_name") != source:
+            continue
+        if dt_from or dt_to:
+            if not row.get("timestamp"):
+                continue
+            timestamp = datetime.fromisoformat(row["timestamp"])
+            if dt_from and timestamp < dt_from:
+                continue
+            if dt_to and timestamp > dt_to:
+                continue
+        if tags:
+            metadata = row.get("metadata") or []
+            tag_set = set(tags)
+            match = False
+            if isinstance(metadata, list):
+                match = bool(tag_set.intersection({str(item) for item in metadata}))
+            elif isinstance(metadata, dict):
+                meta_tags = metadata.get("tags", [])
+                if isinstance(meta_tags, list):
+                    match = bool(tag_set.intersection({str(item) for item in meta_tags}))
+            if not match:
+                continue
+        filtered.append(row)
+        if len(filtered) >= top_k:
+            break
+
+    return {
+        "query": query,
+        "count": len(filtered),
+        "results": filtered,
+    }
+
+
+@mcp.tool()
+def archive_memory(
+    memory_ids: Optional[List[str]] = None,
+    summary_ids: Optional[List[int]] = None,
+    cluster_ids: Optional[List[str]] = None,
+    threshold: Optional[dict] = None,
+    mode: str = "archive_and_tombstone",
+    reason: Optional[str] = None,
+    actor: Optional[str] = None,
+    dry_run: bool = True,
+    limit: int = ARCHIVE_LIMIT_DEFAULT
+) -> dict:
+    """
+    Archive hot records into the cold tier.
+    """
+    if cluster_ids:
+        return {"status": "error", "message": "cluster_ids not supported"}
+    if not reason or not reason.strip():
+        return {"status": "error", "message": "reason is required"}
+    _validate_limit(limit, "limit", ARCHIVE_LIMIT_MAX)
+
+    mode = mode.strip().lower()
+    valid_modes = {"archive_only", "archive_and_tombstone", "archive_and_summarize_then_archive"}
+    if mode not in valid_modes:
+        return {"status": "error", "message": f"Invalid mode. Must be one of: {', '.join(sorted(valid_modes))}"}
+
+    db = DB.SessionLocal()
+    try:
+        actor_name = actor or "mcp"
+        candidates: list[tuple[str, object]] = []
+        summary_records: list[MemorySummary] = []
+
+        if memory_ids:
+            refs = [_parse_memory_ref(raw) for raw in memory_ids]
+            candidates.extend(_collect_records_by_refs(db, refs))
+
+        if summary_ids:
+            summary_records.extend(
+                db.query(MemorySummary).filter(MemorySummary.id.in_(summary_ids)).all()
+            )
+
+        if threshold:
+            below_score = threshold.get("below_score")
+            threshold_type = threshold.get("type", "memory").lower()
+            if below_score is None:
+                return {"status": "error", "message": "threshold requires below_score"}
+            if threshold_type not in {"memory", "summary", "any"}:
+                return {"status": "error", "message": "threshold.type must be memory|summary|any"}
+
+            if threshold_type in {"memory", "any"}:
+                candidates.extend(
+                    _collect_threshold_records(
+                        db,
+                        tier=MemoryTier.hot,
+                        below_score=below_score,
+                        above_score=None,
+                        types=list(MEMORY_MODELS.keys()),
+                        limit=limit,
+                    )
+                )
+            if threshold_type in {"summary", "any"}:
+                summary_records.extend(
+                    _collect_summary_threshold_records(
+                        db,
+                        tier=MemoryTier.hot,
+                        below_score=below_score,
+                        above_score=None,
+                        limit=limit,
+                    )
+                )
+
+        # Deduplicate candidates
+        seen = set()
+        unique_candidates = []
+        for mem_type, record in candidates:
+            key = (mem_type, record.id)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_candidates.append((mem_type, record))
+        candidates = unique_candidates[:limit]
+
+        summary_records = list({summary.id: summary for summary in summary_records}.values())[:limit]
+
+        if dry_run:
+            return {
+                "status": "dry_run",
+                "candidate_count": len(candidates),
+                "summary_candidate_count": len(summary_records),
+                "candidates": [
+                    {"type": mem_type, "id": record.id, "score": record.score}
+                    for mem_type, record in candidates
+                ],
+                "summary_candidates": [
+                    {"id": summary.id, "score": summary.score}
+                    for summary in summary_records
+                ],
+            }
+
+        archived_ids = []
+        tombstones_written = 0
+        summaries_created = 0
+
+        for mem_type, record in candidates:
+            if record.tier != MemoryTier.hot:
+                continue
+
+            if mode == "archive_and_summarize_then_archive":
+                summary = _find_summary_for_source(db, mem_type, record.id)
+                summary_text = _summary_text_for_record(mem_type, record)
+                if summary:
+                    summary.summary_text = summary_text
+                else:
+                    summary = MemorySummary(
+                        source_type=mem_type,
+                        source_id=record.id,
+                        source_ids=[record.id],
+                        summary_text=summary_text,
+                        metadata_={"reason": reason},
+                    )
+                    db.add(summary)
+                    summaries_created += 1
+                _write_tombstone(
+                    db,
+                    _serialize_memory_id(mem_type, record.id),
+                    TombstoneAction.summarized,
+                    from_tier=record.tier,
+                    to_tier=record.tier,
+                    reason=reason,
+                    actor=actor_name,
+                )
+                tombstones_written += 1 if TOMBSTONES_ENABLED else 0
+
+            record.tier = MemoryTier.cold
+            record.archived_at = datetime.utcnow()
+            record.archived_reason = reason
+            record.archived_by = actor_name
+            record.purge_eligible = False
+            archived_ids.append(_serialize_memory_id(mem_type, record.id))
+            _write_tombstone(
+                db,
+                _serialize_memory_id(mem_type, record.id),
+                TombstoneAction.archived,
+                from_tier=MemoryTier.hot,
+                to_tier=MemoryTier.cold,
+                reason=reason,
+                actor=actor_name,
+            )
+            tombstones_written += 1 if TOMBSTONES_ENABLED else 0
+
+        for summary in summary_records:
+            if summary.tier != MemoryTier.hot:
+                continue
+            summary.tier = MemoryTier.cold
+            summary.archived_at = datetime.utcnow()
+            summary.archived_reason = reason
+            summary.archived_by = actor_name
+            summary.purge_eligible = False
+            archived_ids.append(f"summary:{summary.id}")
+            _write_tombstone(
+                db,
+                f"summary:{summary.id}",
+                TombstoneAction.archived,
+                from_tier=MemoryTier.hot,
+                to_tier=MemoryTier.cold,
+                reason=reason,
+                actor=actor_name,
+            )
+            tombstones_written += 1 if TOMBSTONES_ENABLED else 0
+
+        db.commit()
+
+        return {
+            "status": "archived",
+            "archived_count": len(archived_ids),
+            "archived_ids": archived_ids,
+            "tombstones_written": tombstones_written,
+            "summaries_created": summaries_created,
+        }
+    finally:
+        db.close()
+
+
+@mcp.tool()
+def rehydrate_memory(
+    memory_ids: Optional[List[str]] = None,
+    summary_ids: Optional[List[int]] = None,
+    cluster_ids: Optional[List[str]] = None,
+    threshold: Optional[dict] = None,
+    query: Optional[str] = None,
+    reason: Optional[str] = None,
+    actor: Optional[str] = None,
+    dry_run: bool = False,
+    limit: int = 50,
+    bump_score: bool = True
+) -> dict:
+    """
+    Rehydrate cold records back into hot tier.
+    """
+    if cluster_ids:
+        return {"status": "error", "message": "cluster_ids not supported"}
+    if not reason or not reason.strip():
+        return {"status": "error", "message": "reason is required"}
+    _validate_limit(limit, "limit", REHYDRATE_LIMIT_MAX)
+
+    db = DB.SessionLocal()
+    try:
+        actor_name = actor or "mcp"
+        candidates: list[tuple[str, object]] = []
+        summary_records: list[MemorySummary] = []
+
+        if memory_ids:
+            refs = [_parse_memory_ref(raw) for raw in memory_ids]
+            candidates.extend(_collect_records_by_refs(db, refs))
+
+        if summary_ids:
+            summary_records.extend(
+                db.query(MemorySummary).filter(MemorySummary.id.in_(summary_ids)).all()
+            )
+
+        if query:
+            cold_results = search_cold_memory(query=query, top_k=limit)
+            for row in cold_results.get("results", []):
+                candidates.extend(_collect_records_by_refs(
+                    db,
+                    [(_parse_memory_ref(_serialize_memory_id(row["source_type"], row["id"])))],
+                ))
+
+        if threshold:
+            below_score = threshold.get("below_score")
+            above_score = threshold.get("above_score")
+            threshold_type = threshold.get("type", "memory").lower()
+            if threshold_type not in {"memory", "summary", "any"}:
+                return {"status": "error", "message": "threshold.type must be memory|summary|any"}
+
+            if threshold_type in {"memory", "any"}:
+                candidates.extend(
+                    _collect_threshold_records(
+                        db,
+                        tier=MemoryTier.cold,
+                        below_score=below_score,
+                        above_score=above_score,
+                        types=list(MEMORY_MODELS.keys()),
+                        limit=limit,
+                    )
+                )
+            if threshold_type in {"summary", "any"}:
+                summary_records.extend(
+                    _collect_summary_threshold_records(
+                        db,
+                        tier=MemoryTier.cold,
+                        below_score=below_score,
+                        above_score=above_score,
+                        limit=limit,
+                    )
+                )
+
+        # Deduplicate candidates
+        seen = set()
+        unique_candidates = []
+        for mem_type, record in candidates:
+            key = (mem_type, record.id)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_candidates.append((mem_type, record))
+        candidates = unique_candidates[:limit]
+
+        summary_records = list({summary.id: summary for summary in summary_records}.values())[:limit]
+
+        if dry_run:
+            return {
+                "status": "dry_run",
+                "candidate_count": len(candidates),
+                "summary_candidate_count": len(summary_records),
+                "candidates": [
+                    {"type": mem_type, "id": record.id, "score": record.score}
+                    for mem_type, record in candidates
+                ],
+                "summary_candidates": [
+                    {"id": summary.id, "score": summary.score}
+                    for summary in summary_records
+                ],
+            }
+
+        rehydrated_ids = []
+        tombstones_written = 0
+
+        for mem_type, record in candidates:
+            if record.tier != MemoryTier.cold:
+                continue
+            record.tier = MemoryTier.hot
+            record.archived_at = None
+            record.archived_reason = None
+            record.archived_by = None
+            record.purge_eligible = False
+            if bump_score:
+                record.access_count = (record.access_count or 0) + 1
+                record.last_accessed_at = datetime.utcnow()
+                _apply_rehydrate_bump(record)
+            rehydrated_ids.append(_serialize_memory_id(mem_type, record.id))
+            _write_tombstone(
+                db,
+                _serialize_memory_id(mem_type, record.id),
+                TombstoneAction.rehydrated,
+                from_tier=MemoryTier.cold,
+                to_tier=MemoryTier.hot,
+                reason=reason,
+                actor=actor_name,
+            )
+            tombstones_written += 1 if TOMBSTONES_ENABLED else 0
+
+        for summary in summary_records:
+            if summary.tier != MemoryTier.cold:
+                continue
+            summary.tier = MemoryTier.hot
+            summary.archived_at = None
+            summary.archived_reason = None
+            summary.archived_by = None
+            summary.purge_eligible = False
+            if bump_score:
+                summary.access_count = (summary.access_count or 0) + 1
+                summary.last_accessed_at = datetime.utcnow()
+                _apply_rehydrate_bump(summary)
+            rehydrated_ids.append(f"summary:{summary.id}")
+            _write_tombstone(
+                db,
+                f"summary:{summary.id}",
+                TombstoneAction.rehydrated,
+                from_tier=MemoryTier.cold,
+                to_tier=MemoryTier.hot,
+                reason=reason,
+                actor=actor_name,
+            )
+            tombstones_written += 1 if TOMBSTONES_ENABLED else 0
+
+        db.commit()
+
+        return {
+            "status": "rehydrated",
+            "rehydrated_count": len(rehydrated_ids),
+            "rehydrated_ids": rehydrated_ids,
+            "tombstones_written": tombstones_written,
+        }
+    finally:
+        db.close()
+
+
+@mcp.tool()
+def list_archive_candidates(
+    below_score: float = SUMMARY_TRIGGER_SCORE,
+    limit: int = ARCHIVE_LIMIT_DEFAULT
+) -> dict:
+    """
+    List archive candidates without mutation.
+    """
+    _validate_limit(limit, "limit", ARCHIVE_LIMIT_MAX)
+    db = DB.SessionLocal()
+    try:
+        candidates = _collect_threshold_records(
+            db,
+            tier=MemoryTier.hot,
+            below_score=below_score,
+            above_score=None,
+            types=list(MEMORY_MODELS.keys()),
+            limit=limit,
+        )
+        return {
+            "status": "ok",
+            "candidate_count": len(candidates),
+            "candidates": [
+                {"type": mem_type, "id": record.id, "score": record.score}
+                for mem_type, record in candidates
+            ],
         }
     finally:
         db.close()
@@ -757,7 +1725,7 @@ def memory_store(
         db.refresh(obs)
         
         # Generate and store embedding
-        embedding_vector = embed_text_sync(observation)
+        embedding_vector = _embed_or_raise(observation)
         emb = Embedding(
             source_type="observation",
             source_id=obs.id,
@@ -786,7 +1754,8 @@ def memory_recall(
     domain: Optional[str] = None,
     min_confidence: float = 0.0,
     limit: int = 10,
-    ai_name: Optional[str] = None
+    ai_name: Optional[str] = None,
+    include_cold: bool = False
 ) -> dict:
     """
     Recall observations by domain and/or confidence filter.
@@ -796,6 +1765,7 @@ def memory_recall(
         min_confidence: Minimum confidence threshold
         limit: Maximum results (default 10)
         ai_name: Filter by AI instance name
+        include_cold: Include cold tier records
     
     Returns:
         List of matching observations
@@ -819,14 +1789,15 @@ def memory_recall(
             query = query.filter(Observation.confidence >= min_confidence)
         if ai_name:
             query = query.filter(AIInstance.name == ai_name)
+        if not include_cold:
+            query = query.filter(Observation.tier == MemoryTier.hot)
         
         results = query.order_by(desc(Observation.timestamp)).limit(limit).all()
         
-        # Update access counts
-        for obs in results:
-            obs.access_count += 1
-            obs.last_accessed = datetime.utcnow()
-        db.commit()
+        if not include_cold:
+            for obs in results:
+                _apply_fetch_bump(obs, SCORE_BUMP_ALPHA)
+            db.commit()
         
         return {
             "count": len(results),
@@ -867,6 +1838,7 @@ def memory_stats() -> dict:
         pattern_count = db.query(func.count(Pattern.id)).scalar()
         concept_count = db.query(func.count(Concept.id)).scalar()
         document_count = db.query(func.count(Document.id)).scalar()
+        summary_count = db.query(func.count(MemorySummary.id)).scalar()
         session_count = db.query(func.count(Session.id)).scalar()
         ai_count = db.query(func.count(AIInstance.id)).scalar()
         embedding_count = db.query(func.count(Embedding.source_id)).scalar()
@@ -879,6 +1851,21 @@ def memory_stats() -> dict:
             Observation.domain, func.count(Observation.id)
         ).group_by(Observation.domain).all()
         
+        hot_counts = {
+            "observations": db.query(func.count(Observation.id)).filter(Observation.tier == MemoryTier.hot).scalar(),
+            "patterns": db.query(func.count(Pattern.id)).filter(Pattern.tier == MemoryTier.hot).scalar(),
+            "concepts": db.query(func.count(Concept.id)).filter(Concept.tier == MemoryTier.hot).scalar(),
+            "documents": db.query(func.count(Document.id)).filter(Document.tier == MemoryTier.hot).scalar(),
+            "summaries": db.query(func.count(MemorySummary.id)).filter(MemorySummary.tier == MemoryTier.hot).scalar(),
+        }
+        cold_counts = {
+            "observations": db.query(func.count(Observation.id)).filter(Observation.tier == MemoryTier.cold).scalar(),
+            "patterns": db.query(func.count(Pattern.id)).filter(Pattern.tier == MemoryTier.cold).scalar(),
+            "concepts": db.query(func.count(Concept.id)).filter(Concept.tier == MemoryTier.cold).scalar(),
+            "documents": db.query(func.count(Document.id)).filter(Document.tier == MemoryTier.cold).scalar(),
+            "summaries": db.query(func.count(MemorySummary.id)).filter(MemorySummary.tier == MemoryTier.cold).scalar(),
+        }
+
         return {
             "status": "healthy",
             "embedding_model": EMBEDDING_MODEL,
@@ -888,9 +1875,14 @@ def memory_stats() -> dict:
                 "patterns": pattern_count,
                 "concepts": concept_count,
                 "documents": document_count,
+                "summaries": summary_count,
                 "sessions": session_count,
                 "ai_instances": ai_count,
                 "embeddings": embedding_count
+            },
+            "tiers": {
+                "hot": hot_counts,
+                "cold": cold_counts,
             },
             "ai_instances": [
                 {"name": ai.name, "platform": ai.platform}
@@ -1013,7 +2005,7 @@ def memory_store_document(
         db.refresh(doc)
         
         # Generate and store embedding from summary
-        embedding_vector = embed_text_sync(content_summary)
+        embedding_vector = _embed_or_raise(content_summary)
         emb = Embedding(
             source_type="document",
             source_id=doc.id,
@@ -1107,7 +2099,7 @@ def memory_store_concept(
         db.refresh(concept)
         
         # Generate and store embedding from description
-        embedding_vector = embed_text_sync(description)
+        embedding_vector = _embed_or_raise(description)
         emb = Embedding(
             source_type="concept",
             source_id=concept.id,
@@ -1130,12 +2122,13 @@ def memory_store_concept(
 
 
 @mcp.tool()
-def memory_get_concept(name: str) -> dict:
+def memory_get_concept(name: str, include_cold: bool = False) -> dict:
     """
     Get a concept by name (case-insensitive, alias-aware).
     
     Args:
         name: Concept name or alias to look up
+        include_cold: Include cold tier records
     
     Returns:
         Concept details or None if not found
@@ -1147,22 +2140,27 @@ def memory_get_concept(name: str) -> dict:
         name_key = name.lower()
         
         # Try direct lookup first
-        concept = db.query(Concept).filter(Concept.name_key == name_key).first()
+        concept_query = db.query(Concept).filter(Concept.name_key == name_key)
+        if not include_cold:
+            concept_query = concept_query.filter(Concept.tier == MemoryTier.hot)
+        concept = concept_query.first()
         
         # If not found, check aliases
         if not concept:
             from models import ConceptAlias
             alias = db.query(ConceptAlias).filter(ConceptAlias.alias_key == name_key).first()
             if alias:
-                concept = db.query(Concept).filter(Concept.id == alias.concept_id).first()
+                concept_query = db.query(Concept).filter(Concept.id == alias.concept_id)
+                if not include_cold:
+                    concept_query = concept_query.filter(Concept.tier == MemoryTier.hot)
+                concept = concept_query.first()
         
         if not concept:
             return {"status": "not_found", "name": name}
         
-        # Update access tracking
-        concept.access_count += 1
-        concept.last_accessed = datetime.utcnow()
-        db.commit()
+        if concept.tier == MemoryTier.hot:
+            _apply_fetch_bump(concept, SCORE_BUMP_ALPHA)
+            db.commit()
         
         return {
             "status": "found",
@@ -1332,7 +2330,8 @@ def memory_add_concept_relationship(
 def memory_related_concepts(
     concept_name: str,
     rel_type: Optional[str] = None,
-    min_weight: float = 0.0
+    min_weight: float = 0.0,
+    include_cold: bool = False
 ) -> dict:
     """
     Get concepts related to a given concept.
@@ -1341,6 +2340,7 @@ def memory_related_concepts(
         concept_name: Concept to find relationships for
         rel_type: Optional filter by relationship type
         min_weight: Minimum relationship weight (default 0.0)
+        include_cold: Include cold tier concepts
     
     Returns:
         List of related concepts with relationship details
@@ -1355,7 +2355,10 @@ def memory_related_concepts(
         
         # Find the concept
         concept_key = concept_name.lower()
-        concept = db.query(Concept).filter(Concept.name_key == concept_key).first()
+        concept_query = db.query(Concept).filter(Concept.name_key == concept_key)
+        if not include_cold:
+            concept_query = concept_query.filter(Concept.tier == MemoryTier.hot)
+        concept = concept_query.first()
         if not concept:
             return {"status": "not_found", "concept": concept_name}
         
@@ -1368,6 +2371,9 @@ def memory_related_concepts(
             ConceptRelationship.from_concept_id == concept.id,
             ConceptRelationship.weight >= min_weight
         )
+
+        if not include_cold:
+            query = query.filter(Concept.tier == MemoryTier.hot)
         
         if rel_type:
             query = query.filter(ConceptRelationship.rel_type == rel_type)
@@ -1383,6 +2389,9 @@ def memory_related_concepts(
             ConceptRelationship.to_concept_id == concept.id,
             ConceptRelationship.weight >= min_weight
         )
+
+        if not include_cold:
+            query = query.filter(Concept.tier == MemoryTier.hot)
         
         if rel_type:
             query = query.filter(ConceptRelationship.rel_type == rel_type)
@@ -1490,7 +2499,7 @@ def memory_update_pattern(
             db.refresh(existing)
             
             # Update embedding
-            embedding_vector = embed_text_sync(pattern_text)
+            embedding_vector = _embed_or_raise(pattern_text)
             
             # Delete old embedding
             db.query(Embedding).filter(
@@ -1532,7 +2541,7 @@ def memory_update_pattern(
             db.refresh(pattern)
             
             # Generate and store embedding
-            embedding_vector = embed_text_sync(pattern_text)
+            embedding_vector = _embed_or_raise(pattern_text)
             emb = Embedding(
                 source_type="pattern",
                 source_id=pattern.id,
@@ -1555,13 +2564,14 @@ def memory_update_pattern(
 
 
 @mcp.tool()
-def memory_get_pattern(category: str, pattern_name: str) -> dict:
+def memory_get_pattern(category: str, pattern_name: str, include_cold: bool = False) -> dict:
     """
     Get a specific pattern by category and name.
     
     Args:
         category: Pattern category
         pattern_name: Pattern name within category
+        include_cold: Include cold tier records
     
     Returns:
         Pattern details or not_found status
@@ -1571,10 +2581,13 @@ def memory_get_pattern(category: str, pattern_name: str) -> dict:
 
     db = DB.SessionLocal()
     try:
-        pattern = db.query(Pattern).filter(
+        pattern_query = db.query(Pattern).filter(
             Pattern.category == category,
             Pattern.pattern_name == pattern_name
-        ).first()
+        )
+        if not include_cold:
+            pattern_query = pattern_query.filter(Pattern.tier == MemoryTier.hot)
+        pattern = pattern_query.first()
         
         if not pattern:
             return {
@@ -1583,10 +2596,9 @@ def memory_get_pattern(category: str, pattern_name: str) -> dict:
                 "pattern_name": pattern_name
             }
         
-        # Update access tracking
-        pattern.access_count += 1
-        pattern.last_accessed = datetime.utcnow()
-        db.commit()
+        if pattern.tier == MemoryTier.hot:
+            _apply_fetch_bump(pattern, SCORE_BUMP_ALPHA)
+            db.commit()
         
         return {
             "status": "found",
@@ -1607,7 +2619,8 @@ def memory_get_pattern(category: str, pattern_name: str) -> dict:
 def memory_patterns(
     category: Optional[str] = None,
     min_confidence: float = 0.0,
-    limit: int = 20
+    limit: int = 20,
+    include_cold: bool = False
 ) -> dict:
     """
     List patterns with optional filtering by category and confidence.
@@ -1616,6 +2629,7 @@ def memory_patterns(
         category: Optional category filter
         min_confidence: Minimum confidence threshold (default 0.0)
         limit: Maximum results (default 20)
+        include_cold: Include cold tier records
     
     Returns:
         List of matching patterns
@@ -1632,8 +2646,15 @@ def memory_patterns(
             query = query.filter(Pattern.category == category)
         if min_confidence > 0:
             query = query.filter(Pattern.confidence >= min_confidence)
+        if not include_cold:
+            query = query.filter(Pattern.tier == MemoryTier.hot)
         
         results = query.order_by(desc(Pattern.last_updated)).limit(limit).all()
+
+        if not include_cold:
+            for pattern in results:
+                _apply_fetch_bump(pattern, SCORE_BUMP_ALPHA)
+            db.commit()
         
         return {
             "count": len(results),
@@ -1998,13 +3019,21 @@ class SlashNormalizerASGI:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize on startup, cleanup on shutdown."""
-    global cleanup_task
+    global cleanup_task, retention_task
     init_db()
     init_http_client()
     if CLEANUP_INTERVAL_SECONDS > 0:
         await _run_cleanup_once()
         cleanup_task = asyncio.create_task(_cleanup_loop())
+    if RETENTION_TICK_SECONDS > 0:
+        retention_task = asyncio.create_task(_retention_loop())
     yield
+    if retention_task:
+        retention_task.cancel()
+        try:
+            await retention_task
+        except asyncio.CancelledError:
+            pass
     if cleanup_task:
         cleanup_task.cancel()
         try:
@@ -2077,12 +3106,14 @@ def _check_db_health() -> dict:
         return {"ok": False, "error": str(exc)}
 
     current_rev, head_rev = _get_schema_revisions(DB.engine)
+    schema_ok = head_rev is None or current_rev == head_rev
     return {
-        "ok": True,
+        "ok": schema_ok,
         "pgvector_installed": bool(ext_version),
         "pgvector_version": ext_version,
         "schema_revision": current_rev,
         "schema_expected": head_rev,
+        "schema_up_to_date": schema_ok,
     }
 
 # Mount OAuth discovery and authorization routes (for Claude Desktop MCP)
@@ -2122,6 +3153,7 @@ async def health_deps():
     breaker_status = embedding_circuit_breaker.status()
     embedding_status = {
         "status": "unknown",
+        "provider": EMBEDDING_PROVIDER,
         "circuit_breaker": breaker_status,
         "checked": False,
     }

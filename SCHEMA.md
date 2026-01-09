@@ -17,15 +17,23 @@ MemoryGate uses PostgreSQL with the pgvector extension for vector similarity sea
 - Knowledge graph (concepts + relationships)
 - Pattern synthesis
 - Document references
+- Cold storage tiers, summaries, and tombstones for retention
 
 **Current Implementation Status:**
-- ✅ Fully Implemented: ai_instances, sessions, observations, embeddings, documents, concepts, concept_aliases, concept_relationships, patterns
+- ✅ Fully Implemented: ai_instances, sessions, observations, embeddings, documents, concepts, concept_aliases, concept_relationships, patterns, memory_summaries, memory_tombstones
 - 🎉 All core features complete!
 
 **Document Storage:**
 - Documents stored as references with summaries (not full content)
 - Canonical storage: Google Drive
 - Full content fetched on demand via Drive API
+
+---
+
+## Enum Types
+
+- `memory_tier` - hot, cold
+- `tombstone_action` - archived, rehydrated, purged, summarized
 
 ---
 
@@ -118,12 +126,21 @@ CREATE TABLE observations (
     evidence            JSONB DEFAULT '[]',
     session_id          INTEGER REFERENCES sessions(id),
     ai_instance_id      INTEGER REFERENCES ai_instances(id),
-    access_count        INTEGER DEFAULT 0,
-    last_accessed       TIMESTAMP WITH TIME ZONE
+    access_count        BIGINT DEFAULT 0,
+    last_accessed_at    TIMESTAMP WITH TIME ZONE,
+    tier                memory_tier NOT NULL DEFAULT 'hot',
+    archived_at         TIMESTAMP WITH TIME ZONE,
+    archived_reason     TEXT,
+    archived_by         VARCHAR(100),
+    score               FLOAT NOT NULL DEFAULT 0.0,
+    floor_score         FLOAT NOT NULL DEFAULT -9999.0,
+    purge_eligible      BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE INDEX ix_observations_domain ON observations(domain);
 CREATE INDEX ix_observations_confidence ON observations(confidence);
+CREATE INDEX ix_observations_tier ON observations(tier);
+CREATE INDEX ix_observations_score ON observations(score);
 ```
 
 **Columns:**
@@ -136,7 +153,14 @@ CREATE INDEX ix_observations_confidence ON observations(confidence);
 - `session_id` - Foreign key to sessions (optional)
 - `ai_instance_id` - Foreign key to ai_instances (tracks which AI made observation)
 - `access_count` - Number of times retrieved (incremented on search/recall)
-- `last_accessed` - Timestamp of last access
+- `last_accessed_at` - Timestamp of last access
+- `tier` - Hot or cold tier flag
+- `archived_at` - Timestamp when archived to cold tier
+- `archived_reason` - Reason for archival
+- `archived_by` - Actor responsible for archival
+- `score` - Retention score (decays over time)
+- `floor_score` - Lower bound for score decay
+- `purge_eligible` - Soft-purge marker when score is below threshold
 
 **Confidence Levels:**
 - `1.0` - Absolute certainty, direct observation
@@ -225,12 +249,21 @@ CREATE TABLE patterns (
     evidence_observation_ids    JSONB DEFAULT list,
     session_id                  INTEGER REFERENCES sessions(id),
     ai_instance_id              INTEGER REFERENCES ai_instances(id),
-    access_count                INTEGER DEFAULT 0,
-    last_accessed               TIMESTAMP WITH TIME ZONE,
+    access_count                BIGINT DEFAULT 0,
+    last_accessed_at            TIMESTAMP WITH TIME ZONE,
+    tier                        memory_tier NOT NULL DEFAULT 'hot',
+    archived_at                 TIMESTAMP WITH TIME ZONE,
+    archived_reason             TEXT,
+    archived_by                 VARCHAR(100),
+    score                       FLOAT NOT NULL DEFAULT 0.0,
+    floor_score                 FLOAT NOT NULL DEFAULT -9999.0,
+    purge_eligible              BOOLEAN NOT NULL DEFAULT FALSE,
     CONSTRAINT uq_pattern_category_name UNIQUE (category, pattern_name)
 );
 
 CREATE INDEX ix_patterns_category ON patterns(category);
+CREATE INDEX ix_patterns_tier ON patterns(tier);
+CREATE INDEX ix_patterns_score ON patterns(score);
 ```
 
 **Columns:**
@@ -243,7 +276,14 @@ CREATE INDEX ix_patterns_category ON patterns(category);
 - `evidence_observation_ids` - JSONB array of supporting observation IDs
 - `session_id` - Optional session link
 - `ai_instance_id` - AI that synthesized the pattern
-- `access_count` / `last_accessed` - Usage tracking
+- `access_count` / `last_accessed_at` - Usage tracking
+- `tier` - Hot or cold tier flag
+- `archived_at` - Timestamp when archived to cold tier
+- `archived_reason` - Reason for archival
+- `archived_by` - Actor responsible for archival
+- `score` - Retention score (decays over time)
+- `floor_score` - Lower bound for score decay
+- `purge_eligible` - Soft-purge marker when score is below threshold
 
 **Unique Constraint:** (category, pattern_name) - prevents duplicates
 
@@ -283,12 +323,21 @@ CREATE TABLE concepts (
     metadata            JSONB DEFAULT '{}',
     ai_instance_id      INTEGER REFERENCES ai_instances(id),
     created_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    access_count        INTEGER DEFAULT 0,
-    last_accessed       TIMESTAMP WITH TIME ZONE
+    access_count        BIGINT DEFAULT 0,
+    last_accessed_at    TIMESTAMP WITH TIME ZONE,
+    tier                memory_tier NOT NULL DEFAULT 'hot',
+    archived_at         TIMESTAMP WITH TIME ZONE,
+    archived_reason     TEXT,
+    archived_by         VARCHAR(100),
+    score               FLOAT NOT NULL DEFAULT 0.0,
+    floor_score         FLOAT NOT NULL DEFAULT -9999.0,
+    purge_eligible      BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE INDEX ix_concepts_name_key ON concepts(name_key);
 CREATE INDEX ix_concepts_type ON concepts(type);
+CREATE INDEX ix_concepts_tier ON concepts(tier);
+CREATE INDEX ix_concepts_score ON concepts(score);
 ```
 
 **Columns:**
@@ -302,7 +351,14 @@ CREATE INDEX ix_concepts_type ON concepts(type);
 - `metadata` - JSONB for arbitrary metadata
 - `ai_instance_id` - AI that created the concept
 - `created_at` - Creation timestamp
-- `access_count` / `last_accessed` - Usage tracking
+- `access_count` / `last_accessed_at` - Usage tracking
+- `tier` - Hot or cold tier flag
+- `archived_at` - Timestamp when archived to cold tier
+- `archived_reason` - Reason for archival
+- `archived_by` - Actor responsible for archival
+- `score` - Retention score (decays over time)
+- `floor_score` - Lower bound for score decay
+- `purge_eligible` - Soft-purge marker when score is below threshold
 
 **Concept Types:**
 - `project` - Concrete projects
@@ -422,10 +478,20 @@ CREATE TABLE documents (
     publication_date    TIMESTAMP WITH TIME ZONE,
     key_concepts        JSONB DEFAULT list,
     metadata            JSONB DEFAULT dict,
-    access_count        INTEGER DEFAULT 0,
-    last_accessed       TIMESTAMP WITH TIME ZONE,
+    access_count        BIGINT DEFAULT 0,
+    last_accessed_at    TIMESTAMP WITH TIME ZONE,
+    tier                memory_tier NOT NULL DEFAULT 'hot',
+    archived_at         TIMESTAMP WITH TIME ZONE,
+    archived_reason     TEXT,
+    archived_by         VARCHAR(100),
+    score               FLOAT NOT NULL DEFAULT 0.0,
+    floor_score         FLOAT NOT NULL DEFAULT -9999.0,
+    purge_eligible      BOOLEAN NOT NULL DEFAULT FALSE,
     created_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+CREATE INDEX ix_documents_tier ON documents(tier);
+CREATE INDEX ix_documents_score ON documents(score);
 ```
 
 **Columns:**
@@ -437,7 +503,14 @@ CREATE TABLE documents (
 - `publication_date` - Publication timestamp
 - `key_concepts` - JSONB array of associated concept names
 - `metadata` - JSONB for arbitrary metadata (word count, publisher, etc.)
-- `access_count` / `last_accessed` - Usage tracking
+- `access_count` / `last_accessed_at` - Usage tracking
+- `tier` - Hot or cold tier flag
+- `archived_at` - Timestamp when archived to cold tier
+- `archived_reason` - Reason for archival
+- `archived_by` - Actor responsible for archival
+- `score` - Retention score (decays over time)
+- `floor_score` - Lower bound for score decay
+- `purge_eligible` - Soft-purge marker when score is below threshold
 - `created_at` - Record creation timestamp
 
 **Relationships:**
@@ -456,6 +529,77 @@ CREATE TABLE documents (
 
 ---
 
+### memory_summaries
+
+Summaries generated during archive and retention workflows.
+
+```sql
+CREATE TABLE memory_summaries (
+    id                  INTEGER PRIMARY KEY,
+    source_type         VARCHAR(50) NOT NULL,
+    source_id           INTEGER,
+    source_ids          JSONB DEFAULT '[]',
+    summary_text        TEXT NOT NULL,
+    metadata            JSONB DEFAULT '{}',
+    created_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    access_count        BIGINT DEFAULT 0,
+    last_accessed_at    TIMESTAMP WITH TIME ZONE,
+    tier                memory_tier NOT NULL DEFAULT 'hot',
+    archived_at         TIMESTAMP WITH TIME ZONE,
+    archived_reason     TEXT,
+    archived_by         VARCHAR(100),
+    score               FLOAT NOT NULL DEFAULT 0.0,
+    floor_score         FLOAT NOT NULL DEFAULT -9999.0,
+    purge_eligible      BOOLEAN NOT NULL DEFAULT FALSE
+);
+```
+
+**Columns:**
+- `source_type` / `source_id` - Links back to the original record
+- `source_ids` - Optional list of source IDs for cluster summaries
+- `summary_text` - Summary content
+- `metadata` - JSONB metadata for summarization context
+- `access_count` / `last_accessed_at` - Usage tracking
+- `tier` / `archived_*` - Cold storage lifecycle fields
+- `score` / `floor_score` / `purge_eligible` - Retention scoring fields
+
+**Usage:**
+- Created by retention jobs and `archive_memory()` in summarize mode
+- Retrieved via `search_cold_memory()` or `rehydrate_memory()`
+
+---
+
+### memory_tombstones
+
+Audit trail for archive, rehydrate, purge, and summarize actions.
+
+```sql
+CREATE TABLE memory_tombstones (
+    id                  UUID PRIMARY KEY,
+    memory_id           VARCHAR(255) NOT NULL,
+    action              tombstone_action NOT NULL,
+    from_tier           memory_tier,
+    to_tier             memory_tier,
+    reason              TEXT,
+    actor               VARCHAR(100),
+    created_at          TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    metadata            JSONB DEFAULT '{}'
+);
+```
+
+**Columns:**
+- `memory_id` - Identifier in the form `type:id` (or `summary:id`)
+- `action` - archived | rehydrated | purged | summarized
+- `from_tier` / `to_tier` - Tier transition context
+- `reason` / `actor` - Why and who performed the change
+- `metadata` - JSONB metadata payload
+
+**Usage:**
+- Written automatically during archive/rehydrate/purge/summarize actions
+- Supports audit and compliance requirements
+
+---
+
 ## Database Initialization
 
 ### Automatic Setup
@@ -465,8 +609,8 @@ The server performs initialization on startup via `init_db()`:
 ```python
 1. Connect to PostgreSQL
 2. Enable pgvector extension: CREATE EXTENSION IF NOT EXISTS vector
-3. Create all tables: Base.metadata.create_all(engine)
-4. Create HNSW index on embeddings table
+3. Validate schema revision (Alembic) and optionally auto-upgrade
+4. Create indexes defined in migrations (including HNSW if supported)
 ```
 
 ### Manual Reset
@@ -482,9 +626,11 @@ DROP SCHEMA public CASCADE;
 CREATE SCHEMA public;
 \q
 
-# Restart app to recreate tables
-fly apps restart memorygate
+# Recreate schema with Alembic
+alembic upgrade head
 ```
+
+If `AUTO_MIGRATE_ON_STARTUP=true`, restarting the server will also apply migrations in dev environments.
 
 ---
 
@@ -513,7 +659,7 @@ fly apps restart memorygate
    LEFT JOIN observations/patterns/concepts/documents
    ORDER BY e.embedding <=> query_embedding
 4. Return results with similarity scores and source_type discriminator
-5. Update access_count and last_accessed for matched source types
+5. Update access_count, last_accessed_at, and score for hot-tier matches
 ```
 
 ---
@@ -522,13 +668,27 @@ fly apps restart memorygate
 
 All main tables include:
 - `access_count` - Incremented on every retrieval
-- `last_accessed` - Updated with current timestamp
+- `last_accessed_at` - Updated with current timestamp
+- `tier` / `score` - Used by retention to decide hot vs cold
 
 This enables:
 - Usage analytics
 - Cache eviction strategies
 - Access pattern analysis
 - Stale data identification
+
+---
+
+## Retention and Cold Storage
+
+Retention uses a hot/cold tier and a decaying score:
+- Hot tier is the default for search and recall.
+- Scores decay on a periodic retention tick.
+- Records at or below -1 are summarized and archived to cold.
+- Records at or below -2 are marked purge eligible (soft) or deleted (hard).
+- Tombstones preserve an audit trail for archive, rehydrate, purge, and summarize actions.
+
+Cold-tier records are only returned when explicitly requested (e.g., `search_cold_memory()` or `include_cold=true`).
 
 ---
 
@@ -539,11 +699,15 @@ This enables:
 **Existing:**
 - `ix_observations_domain` - Fast domain filtering
 - `ix_observations_confidence` - Fast confidence filtering
+- `ix_observations_tier` / `ix_observations_score` - Tiering and decay lookups
 - `ix_embeddings_source` - Fast embedding lookups
 - `ix_embeddings_vector_hnsw` - Approximate nearest neighbor search
 - `ix_concepts_name_key` - Case-insensitive concept lookup
 - `ix_concepts_type` - Type-based filtering
+- `ix_concepts_tier` / `ix_concepts_score` - Tiering and decay lookups
 - `ix_patterns_category` - Category-based pattern lookup
+- `ix_patterns_tier` / `ix_patterns_score` - Tiering and decay lookups
+- `ix_documents_tier` / `ix_documents_score` - Tiering and decay lookups
 
 ### HNSW Index
 
@@ -563,11 +727,11 @@ ON embeddings USING hnsw (embedding vector_cosine_ops);
 
 ## Migration Strategy
 
-When adding new MCP tools for patterns/concepts/documents:
+When adding new MCP tools or schema changes:
 
-1. Tables already exist (created on init)
-2. Add MCP tool functions in server.py
-3. Follow same pattern as observations:
+1. Add an Alembic migration in `alembic/versions`
+2. Update MCP tool functions in server.py
+3. Follow the observations pattern:
    - Store with embedding generation
    - Search with vector similarity
    - Recall with SQL filtering
@@ -613,7 +777,7 @@ Core principles that guide system behavior and future development:
    - Enables both conversational and non-conversational data storage
 
 4. **Best-Effort Metrics:**
-   - Access metrics (`access_count`, `last_accessed`) are best-effort and may lag under failures
+   - Access metrics (`access_count`, `last_accessed_at`) are best-effort and may lag under failures
    - Not used for critical business logic
 
 5. **No Automatic Cascades:**

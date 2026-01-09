@@ -4,15 +4,33 @@ PostgreSQL + pgvector schema
 """
 
 from datetime import datetime
+from enum import Enum as PyEnum
+import uuid
 from sqlalchemy import (
-    Column, Integer, String, Text, Float, Boolean,
-    DateTime, ForeignKey, CheckConstraint, Index, UniqueConstraint
+    Column, Integer, BigInteger, String, Text, Float, Boolean,
+    DateTime, ForeignKey, CheckConstraint, Index, UniqueConstraint, Enum
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import relationship, declarative_base
 from pgvector.sqlalchemy import Vector
 
 Base = declarative_base()
+
+# =============================================================================
+# Enums
+# =============================================================================
+
+class MemoryTier(str, PyEnum):
+    hot = "hot"
+    cold = "cold"
+
+
+class TombstoneAction(str, PyEnum):
+    archived = "archived"
+    rehydrated = "rehydrated"
+    purged = "purged"
+    summarized = "summarized"
+
 
 # =============================================================================
 # AI Instances (Kee, Hexy, etc.)
@@ -76,8 +94,17 @@ class Observation(Base):
     ai_instance_id = Column(Integer, ForeignKey("ai_instances.id"))
     
     # Access tracking
-    access_count = Column(Integer, default=0)
-    last_accessed = Column(DateTime(timezone=True))
+    access_count = Column(BigInteger, default=0, nullable=False)
+    last_accessed_at = Column(DateTime(timezone=True))
+
+    # Tiering & retention
+    tier = Column(Enum(MemoryTier, name="memory_tier"), default=MemoryTier.hot, nullable=False)
+    archived_at = Column(DateTime(timezone=True))
+    archived_reason = Column(Text)
+    archived_by = Column(String(100))
+    score = Column(Float, default=0.0, nullable=False)
+    floor_score = Column(Float, default=-9999.0, nullable=False)
+    purge_eligible = Column(Boolean, default=False, nullable=False)
     
     # Relationships
     session = relationship("Session", back_populates="observations")
@@ -87,6 +114,8 @@ class Observation(Base):
         CheckConstraint('confidence >= 0 AND confidence <= 1', name='check_confidence'),
         Index('ix_observations_domain', 'domain'),
         Index('ix_observations_confidence', 'confidence'),
+        Index('ix_observations_tier', 'tier'),
+        Index('ix_observations_score', 'score'),
     )
 
 
@@ -110,8 +139,17 @@ class Pattern(Base):
     ai_instance_id = Column(Integer, ForeignKey("ai_instances.id"))
     
     # Access tracking
-    access_count = Column(Integer, default=0)
-    last_accessed = Column(DateTime(timezone=True))
+    access_count = Column(BigInteger, default=0, nullable=False)
+    last_accessed_at = Column(DateTime(timezone=True))
+
+    # Tiering & retention
+    tier = Column(Enum(MemoryTier, name="memory_tier"), default=MemoryTier.hot, nullable=False)
+    archived_at = Column(DateTime(timezone=True))
+    archived_reason = Column(Text)
+    archived_by = Column(String(100))
+    score = Column(Float, default=0.0, nullable=False)
+    floor_score = Column(Float, default=-9999.0, nullable=False)
+    purge_eligible = Column(Boolean, default=False, nullable=False)
     
     # Relationships
     session = relationship("Session", back_populates="patterns")
@@ -120,6 +158,8 @@ class Pattern(Base):
     __table_args__ = (
         UniqueConstraint('category', 'pattern_name', name='uq_pattern_category_name'),
         Index('ix_patterns_category', 'category'),
+        Index('ix_patterns_tier', 'tier'),
+        Index('ix_patterns_score', 'score'),
     )
 
 
@@ -144,8 +184,17 @@ class Concept(Base):
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
     
     # Access tracking
-    access_count = Column(Integer, default=0)
-    last_accessed = Column(DateTime(timezone=True))
+    access_count = Column(BigInteger, default=0, nullable=False)
+    last_accessed_at = Column(DateTime(timezone=True))
+
+    # Tiering & retention
+    tier = Column(Enum(MemoryTier, name="memory_tier"), default=MemoryTier.hot, nullable=False)
+    archived_at = Column(DateTime(timezone=True))
+    archived_reason = Column(Text)
+    archived_by = Column(String(100))
+    score = Column(Float, default=0.0, nullable=False)
+    floor_score = Column(Float, default=-9999.0, nullable=False)
+    purge_eligible = Column(Boolean, default=False, nullable=False)
     
     # Relationships
     ai_instance = relationship("AIInstance", back_populates="concepts")
@@ -154,6 +203,8 @@ class Concept(Base):
     __table_args__ = (
         Index('ix_concepts_name_key', 'name_key'),
         Index('ix_concepts_type', 'type'),
+        Index('ix_concepts_tier', 'tier'),
+        Index('ix_concepts_score', 'score'),
     )
 
 
@@ -205,9 +256,81 @@ class Document(Base):
     metadata_ = Column("metadata", JSONB, default=dict)
     
     # Access tracking
-    access_count = Column(Integer, default=0)
-    last_accessed = Column(DateTime(timezone=True))
+    access_count = Column(BigInteger, default=0, nullable=False)
+    last_accessed_at = Column(DateTime(timezone=True))
+
+    # Tiering & retention
+    tier = Column(Enum(MemoryTier, name="memory_tier"), default=MemoryTier.hot, nullable=False)
+    archived_at = Column(DateTime(timezone=True))
+    archived_reason = Column(Text)
+    archived_by = Column(String(100))
+    score = Column(Float, default=0.0, nullable=False)
+    floor_score = Column(Float, default=-9999.0, nullable=False)
+    purge_eligible = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+
+    __table_args__ = (
+        Index('ix_documents_tier', 'tier'),
+        Index('ix_documents_score', 'score'),
+    )
+
+
+# =============================================================================
+# Summaries
+# =============================================================================
+
+class MemorySummary(Base):
+    __tablename__ = "memory_summaries"
+
+    id = Column(Integer, primary_key=True)
+    source_type = Column(String(50), nullable=False)
+    source_id = Column(Integer, nullable=True)
+    source_ids = Column(JSONB, default=list)
+    summary_text = Column(Text, nullable=False)
+    metadata_ = Column("metadata", JSONB, default=dict)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+
+    # Access tracking
+    access_count = Column(BigInteger, default=0, nullable=False)
+    last_accessed_at = Column(DateTime(timezone=True))
+
+    # Tiering & retention
+    tier = Column(Enum(MemoryTier, name="memory_tier"), default=MemoryTier.hot, nullable=False)
+    archived_at = Column(DateTime(timezone=True))
+    archived_reason = Column(Text)
+    archived_by = Column(String(100))
+    score = Column(Float, default=0.0, nullable=False)
+    floor_score = Column(Float, default=-9999.0, nullable=False)
+    purge_eligible = Column(Boolean, default=False, nullable=False)
+
+    __table_args__ = (
+        Index('ix_memory_summaries_source', 'source_type', 'source_id'),
+        Index('ix_memory_summaries_tier', 'tier'),
+        Index('ix_memory_summaries_score', 'score'),
+    )
+
+
+# =============================================================================
+# Tombstones
+# =============================================================================
+
+class MemoryTombstone(Base):
+    __tablename__ = "memory_tombstones"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    memory_id = Column(String(255), nullable=False)
+    action = Column(Enum(TombstoneAction, name="tombstone_action"), nullable=False)
+    from_tier = Column(Enum(MemoryTier, name="memory_tier"))
+    to_tier = Column(Enum(MemoryTier, name="memory_tier"))
+    reason = Column(Text)
+    actor = Column(String(100))
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    metadata_ = Column("metadata", JSONB, default=dict)
+
+    __table_args__ = (
+        Index('ix_memory_tombstones_memory_id', 'memory_id'),
+        Index('ix_memory_tombstones_action', 'action'),
+    )
 
 
 # =============================================================================

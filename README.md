@@ -436,8 +436,14 @@ export MEMORYGATE_MAX_TEXT_LENGTH="8000"
 export EMBEDDING_TIMEOUT_SECONDS="30"
 export EMBEDDING_RETRY_MAX="2"
 export EMBEDDING_RETRY_BACKOFF_SECONDS="0.5"
+export EMBEDDING_RETRY_JITTER_SECONDS="0.25"
+export EMBEDDING_FAILURE_THRESHOLD="5"
+export EMBEDDING_COOLDOWN_SECONDS="60"
+# export EMBEDDING_HEALTHCHECK_ENABLED="true"
 # export SECURITY_HEADERS_ENABLE_HSTS="true"
 # export TRUSTED_HOSTS="memorygate.ai,localhost"
+export MEMORYGATE_TENANCY_MODE="single"
+# export AUTO_MIGRATE_ON_STARTUP="true"
 
 # Run server
 python server.py
@@ -455,15 +461,18 @@ PostgreSQL 13+ with pgvector extension:
 CREATE EXTENSION IF NOT EXISTS vector;
 ```
 
-Server auto-creates all tables and indexes on startup.
+Server validates the schema on startup and expects Alembic migrations to be applied.
 
 ### Production Hardening Notes
 
-- For production DBs, set `AUTO_CREATE_TABLES=false` and manage schema changes with Alembic migrations.
-- Generate and apply migrations with `alembic revision --autogenerate -m "..."` and `alembic upgrade head`.
+- This is **single-tenant**: all authenticated keys/users share the same data by design.
+- The server enforces `MEMORYGATE_TENANCY_MODE=single`; any other value fails startup.
+- Use Alembic migrations to manage schema changes (`alembic revision --autogenerate -m "..."`, then `alembic upgrade head`).
+- `AUTO_MIGRATE_ON_STARTUP=true` is intended for dev only; production should fail fast if schema drifts.
 - Enable security headers and HSTS for HTTPS deployments (`SECURITY_HEADERS_*`).
 - Configure trusted proxies before honoring `X-Forwarded-For` (`RATE_LIMIT_TRUSTED_PROXY_COUNT` or `RATE_LIMIT_TRUSTED_PROXY_IPS`).
 - Adjust request limits (`MAX_REQUEST_BODY_BYTES`, `MEMORYGATE_MAX_*`) based on your traffic profile.
+- `/health` checks DB connectivity and pgvector; `/health/deps` can optionally probe embeddings.
 
 ---
 

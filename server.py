@@ -7,6 +7,8 @@ import asyncio
 import json
 import logging
 import os
+import random
+import threading
 import time
 from datetime import datetime
 from typing import Optional, List, Sequence
@@ -14,7 +16,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastmcp import FastMCP
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -85,9 +87,11 @@ def _get_float(env_name: str, default: float) -> float:
 
 
 # Database initialization controls
-AUTO_CREATE_TABLES = _get_bool("AUTO_CREATE_TABLES", True)
 AUTO_CREATE_EXTENSIONS = _get_bool("AUTO_CREATE_EXTENSIONS", True)
-AUTO_CREATE_INDEXES = _get_bool("AUTO_CREATE_INDEXES", True)
+AUTO_MIGRATE_ON_STARTUP = _get_bool("AUTO_MIGRATE_ON_STARTUP", False)
+
+# Tenancy mode (single tenant only for now)
+TENANCY_MODE = os.environ.get("MEMORYGATE_TENANCY_MODE", "single").strip().lower()
 
 # Cleanup cadence for OAuth state/session tables
 CLEANUP_INTERVAL_SECONDS = _get_int("CLEANUP_INTERVAL_SECONDS", 900)
@@ -112,6 +116,10 @@ MAX_EMBEDDING_TEXT_LENGTH = _get_int("MEMORYGATE_MAX_EMBEDDING_TEXT_LENGTH", 800
 EMBEDDING_TIMEOUT_SECONDS = _get_float("EMBEDDING_TIMEOUT_SECONDS", 30.0)
 EMBEDDING_RETRY_MAX = _get_int("EMBEDDING_RETRY_MAX", 2)
 EMBEDDING_RETRY_BACKOFF_SECONDS = _get_float("EMBEDDING_RETRY_BACKOFF_SECONDS", 0.5)
+EMBEDDING_RETRY_JITTER_SECONDS = _get_float("EMBEDDING_RETRY_JITTER_SECONDS", 0.25)
+EMBEDDING_FAILURE_THRESHOLD = _get_int("EMBEDDING_FAILURE_THRESHOLD", 5)
+EMBEDDING_COOLDOWN_SECONDS = _get_int("EMBEDDING_COOLDOWN_SECONDS", 60)
+EMBEDDING_HEALTHCHECK_ENABLED = _get_bool("EMBEDDING_HEALTHCHECK_ENABLED", False)
 
 # Rate limiting configuration (optional Redis backend)
 rate_limit_config = load_rate_limit_config_from_env()
@@ -120,6 +128,11 @@ rate_limiter = build_rate_limiter_from_env(rate_limit_config)
 # Request size and security headers
 request_size_config = load_request_size_limit_config_from_env()
 security_headers_config = load_security_headers_config_from_env()
+
+if TENANCY_MODE != "single":
+    raise RuntimeError(
+        "Only single-tenant mode is supported. Set MEMORYGATE_TENANCY_MODE=single."
+    )
 
 # =============================================================================
 # Global State
@@ -132,6 +145,52 @@ class DB:
 
 http_client = None  # Reusable HTTP client for OpenAI API
 cleanup_task = None  # Background cleanup loop
+
+
+def _get_alembic_config():
+    try:
+        from alembic.config import Config
+    except ImportError as exc:
+        raise RuntimeError("Alembic is required for migrations") from exc
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    alembic_cfg = Config(os.path.join(base_dir, "alembic.ini"))
+    alembic_cfg.set_main_option("script_location", os.path.join(base_dir, "alembic"))
+    alembic_cfg.set_main_option("sqlalchemy.url", DATABASE_URL)
+    return alembic_cfg
+
+
+def _get_schema_revisions(engine) -> tuple[Optional[str], Optional[str]]:
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+
+    alembic_cfg = _get_alembic_config()
+    script = ScriptDirectory.from_config(alembic_cfg)
+    head_revision = script.get_current_head()
+    with engine.connect() as conn:
+        context = MigrationContext.configure(conn)
+        current_revision = context.get_current_revision()
+    return current_revision, head_revision
+
+
+def _ensure_schema_up_to_date(engine) -> None:
+    from alembic import command
+
+    current_rev, head_rev = _get_schema_revisions(engine)
+    if current_rev == head_rev:
+        return
+
+    if AUTO_MIGRATE_ON_STARTUP:
+        alembic_cfg = _get_alembic_config()
+        command.upgrade(alembic_cfg, "head")
+        new_current, _ = _get_schema_revisions(engine)
+        if new_current != head_rev:
+            raise RuntimeError("Database migration did not reach expected revision")
+    else:
+        raise RuntimeError(
+            f"Database schema out of date (current={current_rev}, expected={head_rev}). "
+            "Run 'alembic upgrade head' or set AUTO_MIGRATE_ON_STARTUP=true for dev."
+        )
 
 
 def init_http_client():
@@ -196,30 +255,9 @@ def init_db():
     
     # Import OAuth models to register tables with Base
     import oauth_models  # noqa: F401
-    
-    # THEN: Create tables (which depend on vector type)
-    if AUTO_CREATE_TABLES:
-        logger.info("Creating tables...")
-        Base.metadata.create_all(DB.engine)
-    else:
-        logger.info("Skipping table creation (AUTO_CREATE_TABLES=false)")
-    
-    # Create HNSW index for fast vector search (non-fatal if fails)
-    if AUTO_CREATE_INDEXES and AUTO_CREATE_TABLES:
-        try:
-            with DB.engine.connect() as conn:
-                conn.execute(text("""
-                    CREATE INDEX IF NOT EXISTS ix_embeddings_vector_hnsw 
-                    ON embeddings USING hnsw (embedding vector_cosine_ops)
-                """))
-                conn.commit()
-            logger.info("HNSW index ready")
-        except Exception as e:
-            logger.warning(f"Could not create HNSW index (non-fatal): {e}")
-    elif not AUTO_CREATE_INDEXES:
-        logger.info("Skipping index creation (AUTO_CREATE_INDEXES=false)")
-    else:
-        logger.info("Skipping index creation (AUTO_CREATE_TABLES=false)")
+
+    # Ensure schema is up to date via Alembic migrations
+    _ensure_schema_up_to_date(DB.engine)
     
     logger.info("Database initialized")
 
@@ -227,6 +265,8 @@ def init_db():
 async def embed_text(text: str) -> List[float]:
     """Generate embedding using OpenAI API."""
     _validate_embedding_text(text)
+    if embedding_circuit_breaker.is_open():
+        _raise_embedding_unavailable("circuit breaker open")
     timeout = httpx.Timeout(EMBEDDING_TIMEOUT_SECONDS)
     async with httpx.AsyncClient(timeout=timeout) as client:
         for attempt in range(EMBEDDING_RETRY_MAX + 1):
@@ -244,24 +284,36 @@ async def embed_text(text: str) -> List[float]:
                 )
             except httpx.RequestError as exc:
                 if attempt >= EMBEDDING_RETRY_MAX:
-                    raise
-                await asyncio.sleep(EMBEDDING_RETRY_BACKOFF_SECONDS * (2 ** attempt))
+                    embedding_circuit_breaker.record_failure(str(exc))
+                    _raise_embedding_unavailable(str(exc))
+                await _async_sleep_backoff(attempt)
                 continue
 
             if response.status_code in {429, 500, 502, 503, 504}:
                 if attempt >= EMBEDDING_RETRY_MAX:
-                    response.raise_for_status()
-                await asyncio.sleep(EMBEDDING_RETRY_BACKOFF_SECONDS * (2 ** attempt))
+                    embedding_circuit_breaker.record_failure(
+                        f"status {response.status_code}"
+                    )
+                    _raise_embedding_unavailable(f"status {response.status_code}")
+                await _async_sleep_backoff(attempt)
                 continue
+            if response.status_code >= 400:
+                embedding_circuit_breaker.record_failure(
+                    f"status {response.status_code}"
+                )
+                _raise_embedding_unavailable(f"status {response.status_code}")
 
             response.raise_for_status()
             data = response.json()
+            embedding_circuit_breaker.record_success()
             return data["data"][0]["embedding"]
 
 
 def embed_text_sync(text: str) -> List[float]:
     """Synchronous version of embed_text using pooled HTTP client."""
     _validate_embedding_text(text)
+    if embedding_circuit_breaker.is_open():
+        _raise_embedding_unavailable("circuit breaker open")
     global http_client
     if http_client is None:
         init_http_client()
@@ -277,18 +329,28 @@ def embed_text_sync(text: str) -> List[float]:
             )
         except httpx.RequestError:
             if attempt >= EMBEDDING_RETRY_MAX:
-                raise
-            time.sleep(EMBEDDING_RETRY_BACKOFF_SECONDS * (2 ** attempt))
+                embedding_circuit_breaker.record_failure("request error")
+                _raise_embedding_unavailable("request error")
+            _sleep_backoff(attempt)
             continue
 
         if response.status_code in {429, 500, 502, 503, 504}:
             if attempt >= EMBEDDING_RETRY_MAX:
-                response.raise_for_status()
-            time.sleep(EMBEDDING_RETRY_BACKOFF_SECONDS * (2 ** attempt))
+                embedding_circuit_breaker.record_failure(
+                    f"status {response.status_code}"
+                )
+                _raise_embedding_unavailable(f"status {response.status_code}")
+            _sleep_backoff(attempt)
             continue
+        if response.status_code >= 400:
+            embedding_circuit_breaker.record_failure(
+                f"status {response.status_code}"
+            )
+            _raise_embedding_unavailable(f"status {response.status_code}")
 
         response.raise_for_status()
         data = response.json()
+        embedding_circuit_breaker.record_success()
         return data["data"][0]["embedding"]
 
 
@@ -360,6 +422,73 @@ def _validate_metadata(metadata: Optional[dict], field: str) -> None:
 def _validate_embedding_text(text: str) -> None:
     _validate_required_text(text, "text", MAX_EMBEDDING_TEXT_LENGTH)
 
+
+class EmbeddingProviderError(RuntimeError):
+    """Raised when the embedding provider is unavailable."""
+
+
+class EmbeddingCircuitBreaker:
+    def __init__(self, failure_threshold: int, cooldown_seconds: int):
+        self._failure_threshold = max(1, failure_threshold)
+        self._cooldown_seconds = max(1, cooldown_seconds)
+        self._lock = threading.Lock()
+        self._consecutive_failures = 0
+        self._cooldown_until = 0.0
+        self._last_error: Optional[str] = None
+        self._last_failure_ts: Optional[float] = None
+        self._last_success_ts: Optional[float] = None
+
+    def is_open(self) -> bool:
+        with self._lock:
+            return time.time() < self._cooldown_until
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._consecutive_failures = 0
+            self._cooldown_until = 0.0
+            self._last_success_ts = time.time()
+
+    def record_failure(self, error: str) -> None:
+        with self._lock:
+            self._consecutive_failures += 1
+            self._last_error = error
+            self._last_failure_ts = time.time()
+            if self._consecutive_failures >= self._failure_threshold:
+                self._cooldown_until = time.time() + self._cooldown_seconds
+
+    def status(self) -> dict:
+        with self._lock:
+            return {
+                "open": time.time() < self._cooldown_until,
+                "consecutive_failures": self._consecutive_failures,
+                "cooldown_until_epoch": int(self._cooldown_until) if self._cooldown_until else None,
+                "last_error": self._last_error,
+                "last_failure_epoch": int(self._last_failure_ts) if self._last_failure_ts else None,
+                "last_success_epoch": int(self._last_success_ts) if self._last_success_ts else None,
+            }
+
+
+embedding_circuit_breaker = EmbeddingCircuitBreaker(
+    failure_threshold=EMBEDDING_FAILURE_THRESHOLD,
+    cooldown_seconds=EMBEDDING_COOLDOWN_SECONDS,
+)
+
+
+def _raise_embedding_unavailable(detail: str) -> None:
+    logger.warning(f"Embedding provider unavailable: {detail}")
+    raise EmbeddingProviderError("embedding provider unavailable")
+
+
+def _sleep_backoff(attempt: int) -> None:
+    base = EMBEDDING_RETRY_BACKOFF_SECONDS * (2 ** attempt)
+    jitter = random.uniform(0, EMBEDDING_RETRY_JITTER_SECONDS)
+    time.sleep(base + jitter)
+
+
+async def _async_sleep_backoff(attempt: int) -> None:
+    base = EMBEDDING_RETRY_BACKOFF_SECONDS * (2 ** attempt)
+    jitter = random.uniform(0, EMBEDDING_RETRY_JITTER_SECONDS)
+    await asyncio.sleep(base + jitter)
 def get_or_create_ai_instance(db, name: str, platform: str) -> AIInstance:
     """Get or create an AI instance by name."""
     instance = db.query(AIInstance).filter(AIInstance.name == name).first()
@@ -1885,6 +2014,8 @@ async def lifespan(app: FastAPI):
     cleanup_http_client()
     if rate_limiter:
         await rate_limiter.close()
+    if DB.engine:
+        DB.engine.dispose()
 
 
 app = FastAPI(title="MemoryGate", redirect_slashes=False, lifespan=lifespan)
@@ -1931,6 +2062,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+def _check_db_health() -> dict:
+    if DB.engine is None:
+        return {"ok": False, "error": "db_not_initialized"}
+
+    try:
+        with DB.engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+            ext_version = conn.execute(
+                text("SELECT extversion FROM pg_extension WHERE extname = 'vector'")
+            ).scalar()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    current_rev, head_rev = _get_schema_revisions(DB.engine)
+    return {
+        "ok": True,
+        "pgvector_installed": bool(ext_version),
+        "pgvector_version": ext_version,
+        "schema_revision": current_rev,
+        "schema_expected": head_rev,
+    }
+
 # Mount OAuth discovery and authorization routes (for Claude Desktop MCP)
 from oauth_discovery import router as oauth_discovery_router
 app.include_router(oauth_discovery_router)
@@ -1944,11 +2098,55 @@ app.include_router(auth_router)
 @app.get("/health")
 async def health():
     """Health check endpoint."""
+    db_health = _check_db_health()
+    if not db_health.get("ok") or not db_health.get("pgvector_installed"):
+        raise HTTPException(status_code=503, detail=db_health)
+
     return {
         "status": "healthy",
         "service": "MemoryGate",
         "version": "0.1.0",
-        "instance_id": os.environ.get("MEMORYGATE_INSTANCE_ID", "memorygate-1")
+        "instance_id": os.environ.get("MEMORYGATE_INSTANCE_ID", "memorygate-1"),
+        "tenant_mode": TENANCY_MODE,
+        "database": db_health,
+    }
+
+
+@app.get("/health/deps")
+async def health_deps():
+    """Dependency health checks (optional embedding provider probe)."""
+    db_health = _check_db_health()
+    if not db_health.get("ok") or not db_health.get("pgvector_installed"):
+        raise HTTPException(status_code=503, detail={"database": db_health})
+
+    breaker_status = embedding_circuit_breaker.status()
+    embedding_status = {
+        "status": "unknown",
+        "circuit_breaker": breaker_status,
+        "checked": False,
+    }
+
+    if breaker_status.get("open"):
+        embedding_status["status"] = "cooldown"
+    elif EMBEDDING_HEALTHCHECK_ENABLED:
+        embedding_status["checked"] = True
+        start = time.time()
+        try:
+            embed_text_sync("healthcheck")
+            embedding_status["status"] = "ok"
+            embedding_status["latency_ms"] = int((time.time() - start) * 1000)
+        except EmbeddingProviderError as exc:
+            embedding_status["status"] = "error"
+            embedding_status["error"] = str(exc)
+    else:
+        embedding_status["status"] = "skipped"
+
+    return {
+        "status": "healthy",
+        "service": "MemoryGate",
+        "tenant_mode": TENANCY_MODE,
+        "database": db_health,
+        "embedding_provider": embedding_status,
     }
 
 
@@ -1959,9 +2157,11 @@ async def root():
         "service": "MemoryGate",
         "version": "0.1.0",
         "description": "Persistent Memory-as-a-Service for AI Agents",
+        "tenant_mode": TENANCY_MODE,
         "embedding_model": EMBEDDING_MODEL,
         "endpoints": {
             "health": "/health",
+            "health_deps": "/health/deps",
             "mcp": "/mcp",
             "auth": {
                 "client_credentials": "/auth/client",

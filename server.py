@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastmcp import FastMCP
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from sqlalchemy import create_engine, text, func, desc, case, and_, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 import numpy as np
 
@@ -1030,8 +1031,14 @@ def get_or_create_ai_instance(db, name: str, platform: str) -> AIInstance:
     if not instance:
         instance = AIInstance(name=name, platform=platform)
         db.add(instance)
-        db.commit()
-        db.refresh(instance)
+        try:
+            db.commit()
+            db.refresh(instance)
+        except IntegrityError as exc:
+            db.rollback()
+            instance = db.query(AIInstance).filter(AIInstance.name == name).first()
+            if instance is None:
+                raise exc
     return instance
 
 
@@ -1052,8 +1059,14 @@ def get_or_create_session(
             source_url=source_url
         )
         db.add(session)
-        db.commit()
-        db.refresh(session)
+        try:
+            db.commit()
+            db.refresh(session)
+        except IntegrityError as exc:
+            db.rollback()
+            session = db.query(Session).filter(Session.conversation_id == conversation_id).first()
+            if session is None:
+                raise exc
     elif title and session.title != title:
         session.title = title
         session.last_active = datetime.utcnow()

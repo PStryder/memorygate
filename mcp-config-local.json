@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "MemoryGate-Local-v2": {
+      "url": "http://localhost:8080/mcp",
+      "transport": {
+        "type": "sse"
+      }
+    }
+  }
+}

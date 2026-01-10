@@ -62,3 +62,20 @@ def db_session(db_engine):
         yield session
     finally:
         session.close()
+
+
+@pytest.fixture
+def server_db(db_engine):
+    """Bind server.DB to the in-memory engine for tool-level tests."""
+    from server import DB
+
+    SessionLocal = sessionmaker(bind=db_engine)
+    previous_engine = DB.engine
+    previous_session = DB.SessionLocal
+    DB.engine = db_engine
+    DB.SessionLocal = SessionLocal
+    try:
+        yield DB
+    finally:
+        DB.engine = previous_engine
+        DB.SessionLocal = previous_session

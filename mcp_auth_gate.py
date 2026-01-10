@@ -7,7 +7,7 @@ SSE-safe (no buffering), validates headers before forwarding to MCP app.
 
 import os
 import json
-from typing import Callable
+from typing import Callable, Awaitable, Optional
 
 from auth_middleware import verify_request_api_key
 
@@ -23,14 +23,20 @@ class MCPAuthGateASGI:
     - Respects REQUIRE_MCP_AUTH env flag
     """
     
-    def __init__(self, wrapped_app, sessionmaker_getter):
+    def __init__(
+        self,
+        wrapped_app,
+        sessionmaker_getter,
+        tool_inventory_checker: Optional[Callable[[], Awaitable[dict]]] = None,
+    ):
         self.wrapped_app = wrapped_app
         self.get_sessionmaker = sessionmaker_getter
+        self.tool_inventory_checker = tool_inventory_checker
         self.require_auth = os.environ.get("REQUIRE_MCP_AUTH", "true").lower() == "true"
     
     async def __call__(self, scope, receive, send):
-        # Only gate HTTP requests to /mcp/* paths
-        if scope["type"] != "http" or not scope["path"].startswith("/mcp/"):
+        # Only gate HTTP requests
+        if scope["type"] != "http":
             await self.wrapped_app(scope, receive, send)
             return
         
@@ -69,6 +75,13 @@ class MCPAuthGateASGI:
                 await self._send_401(scope, send)
                 return
             
+            # Check tool inventory health (refresh if empty)
+            if self.tool_inventory_checker:
+                status = await self.tool_inventory_checker()
+                if status.get("tool_count", 0) == 0:
+                    await self._send_503_tool_inventory(send, status)
+                    return
+
             # User authenticated - forward to MCP app
             await self.wrapped_app(scope, receive, send)
             
@@ -112,6 +125,32 @@ class MCPAuthGateASGI:
             ],
         })
         
+        await send({
+            "type": "http.response.body",
+            "body": response_body,
+        })
+
+    async def _send_503_tool_inventory(self, send, status: dict):
+        """Send 503 when tool inventory is empty."""
+        retry_after = status.get("retry_after_seconds")
+        response_body = json.dumps({
+            "error": "Service Unavailable",
+            "message": "Tool inventory empty - retry after backoff",
+            "tool_inventory": status,
+        }).encode()
+
+        headers = [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(response_body)).encode()),
+        ]
+        if retry_after:
+            headers.append((b"retry-after", str(retry_after).encode()))
+
+        await send({
+            "type": "http.response.start",
+            "status": 503,
+            "headers": headers,
+        })
         await send({
             "type": "http.response.body",
             "body": response_body,

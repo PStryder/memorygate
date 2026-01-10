@@ -10,8 +10,9 @@ import os
 import random
 import threading
 import time
+from functools import wraps
 from datetime import datetime
-from typing import Optional, List, Sequence
+from typing import Optional, List, Sequence, Callable, Any
 from contextlib import asynccontextmanager
 
 import httpx
@@ -119,6 +120,7 @@ MAX_LIST_ITEMS = _get_int("MEMORYGATE_MAX_LIST_ITEMS", 50)
 MAX_LIST_ITEM_LENGTH = _get_int("MEMORYGATE_MAX_LIST_ITEM_LENGTH", 1000)
 MAX_TAG_ITEMS = _get_int("MEMORYGATE_MAX_TAG_ITEMS", MAX_LIST_ITEMS)
 MAX_RELATIONSHIP_ITEMS = _get_int("MEMORYGATE_MAX_RELATIONSHIP_ITEMS", MAX_LIST_ITEMS)
+TOOL_INVENTORY_RETRY_SECONDS = _get_int("MEMORYGATE_TOOL_INVENTORY_RETRY_SECONDS", 5)
 MAX_EMBEDDING_TEXT_LENGTH = _get_int("MEMORYGATE_MAX_EMBEDDING_TEXT_LENGTH", 8000)
 
 # OpenAI retry/backoff
@@ -733,37 +735,91 @@ def _store_embedding(
 # Helper Functions
 # =============================================================================
 
+class ValidationIssue(ValueError):
+    def __init__(self, message: str, field: str = "unknown", error_type: str = "invalid"):
+        super().__init__(message)
+        self.field = field
+        self.error_type = error_type
+
+
+def _tool_error_payload(tool_name: str, exc: ValidationIssue) -> dict:
+    return {
+        "status": "error",
+        "error_type": "validation_error",
+        "tool": tool_name,
+        "field": exc.field,
+        "message": str(exc),
+    }
+
+
+def _log_validation_issue(tool_name: str, exc: ValidationIssue, warn: bool = False) -> None:
+    payload = {
+        "tool": tool_name,
+        "field": exc.field,
+        "error_type": exc.error_type,
+        "detail": str(exc),
+    }
+    if warn:
+        logger.warning("tool_validation_error", extra=payload)
+    else:
+        logger.info("tool_validation_error", extra=payload)
+
+
+def _tool_error_handler(fn: Callable[..., dict]) -> Callable[..., dict]:
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ValidationIssue as exc:
+            _log_validation_issue(fn.__name__, exc, warn=False)
+            return _tool_error_payload(fn.__name__, exc)
+        except ValueError as exc:
+            issue = ValidationIssue(str(exc), field="unknown", error_type="value_error")
+            _log_validation_issue(fn.__name__, issue, warn=True)
+            return _tool_error_payload(fn.__name__, issue)
+    return wrapper
+
+
+def mcp_tool(*args, **kwargs):
+    def decorator(fn: Callable[..., dict]):
+        wrapped = _tool_error_handler(fn)
+        _REGISTERED_TOOLS.append((wrapped, args, kwargs))
+        mcp.tool(*args, **kwargs)(wrapped)
+        return wrapped
+    return decorator
+
+
 def _validate_required_text(value: str, field: str, max_len: int) -> None:
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{field} must be a non-empty string")
+        raise ValidationIssue(f"{field} must be a non-empty string", field=field, error_type="required")
     if len(value) > max_len:
-        raise ValueError(f"{field} exceeds max length {max_len}")
+        raise ValidationIssue(f"{field} exceeds max length {max_len}", field=field, error_type="max_length")
 
 
 def _validate_optional_text(value: Optional[str], field: str, max_len: int) -> None:
     if value is None:
         return
     if not isinstance(value, str):
-        raise ValueError(f"{field} must be a string")
+        raise ValidationIssue(f"{field} must be a string", field=field, error_type="invalid_type")
     if len(value) > max_len:
-        raise ValueError(f"{field} exceeds max length {max_len}")
+        raise ValidationIssue(f"{field} exceeds max length {max_len}", field=field, error_type="max_length")
 
 
 def _validate_limit(value: int, field: str, max_value: int) -> None:
     if value <= 0 or value > max_value:
-        raise ValueError(f"{field} must be between 1 and {max_value}")
+        raise ValidationIssue(f"{field} must be between 1 and {max_value}", field=field, error_type="out_of_range")
 
 
 def _validate_confidence(value: float, field: str) -> None:
     if value < 0.0 or value > 1.0:
-        raise ValueError(f"{field} must be between 0.0 and 1.0")
+        raise ValidationIssue(f"{field} must be between 0.0 and 1.0", field=field, error_type="out_of_range")
 
 
 def _validate_list(values: Optional[Sequence], field: str, max_items: int) -> None:
     if values is None:
         return
     if len(values) > max_items:
-        raise ValueError(f"{field} exceeds max items {max_items}")
+        raise ValidationIssue(f"{field} exceeds max items {max_items}", field=field, error_type="max_items")
 
 
 def _validate_string_list(
@@ -775,12 +831,16 @@ def _validate_string_list(
     if values is None:
         return
     if len(values) > max_items:
-        raise ValueError(f"{field} exceeds max items {max_items}")
+        raise ValidationIssue(f"{field} exceeds max items {max_items}", field=field, error_type="max_items")
     for item in values:
         if not isinstance(item, str):
-            raise ValueError(f"{field} must contain only strings")
+            raise ValidationIssue(f"{field} must contain only strings", field=field, error_type="invalid_type")
         if len(item) > max_item_length:
-            raise ValueError(f"{field} item exceeds max length {max_item_length}")
+            raise ValidationIssue(
+                f"{field} item exceeds max length {max_item_length}",
+                field=field,
+                error_type="max_length",
+            )
 
 
 def _validate_metadata(metadata: Optional[dict], field: str) -> None:
@@ -789,13 +849,52 @@ def _validate_metadata(metadata: Optional[dict], field: str) -> None:
     try:
         size = len(json.dumps(metadata))
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field} must be JSON-serializable") from exc
+        raise ValidationIssue(f"{field} must be JSON-serializable", field=field, error_type="invalid_type") from exc
     if size > MAX_METADATA_BYTES:
-        raise ValueError(f"{field} exceeds max size {MAX_METADATA_BYTES} bytes")
+        raise ValidationIssue(
+            f"{field} exceeds max size {MAX_METADATA_BYTES} bytes",
+            field=field,
+            error_type="max_bytes",
+        )
 
 
 def _validate_embedding_text(text: str) -> None:
     _validate_required_text(text, "text", MAX_EMBEDDING_TEXT_LENGTH)
+
+
+def _validate_evidence_observation_ids(db, evidence_ids: Optional[Sequence[int]]) -> None:
+    if not evidence_ids:
+        return
+    invalid_types = [
+        value for value in evidence_ids
+        if isinstance(value, bool) or not isinstance(value, int)
+    ]
+    if invalid_types:
+        raise ValidationIssue(
+            f"evidence_observation_ids must contain integer IDs",
+            field="evidence_observation_ids",
+            error_type="invalid_type",
+        )
+    invalid_values = [value for value in evidence_ids if value <= 0]
+    if invalid_values:
+        raise ValidationIssue(
+            f"evidence_observation_ids must be positive integers: {invalid_values}",
+            field="evidence_observation_ids",
+            error_type="invalid_id",
+        )
+    existing_rows = (
+        db.query(Observation.id)
+        .filter(Observation.id.in_(set(evidence_ids)))
+        .all()
+    )
+    existing_ids = {row[0] for row in existing_rows}
+    missing_ids = sorted({value for value in evidence_ids if value not in existing_ids})
+    if missing_ids:
+        raise ValidationIssue(
+            f"evidence_observation_ids not found: {missing_ids}",
+            field="evidence_observation_ids",
+            error_type="not_found",
+        )
 
 
 class EmbeddingProviderError(RuntimeError):
@@ -972,9 +1071,27 @@ def _parse_memory_ref(raw) -> tuple[str, int]:
         value = raw.strip()
         if ":" in value:
             mem_type, mem_id = value.split(":", 1)
-            return mem_type.strip().lower(), int(mem_id)
-        return "observation", int(value)
-    raise ValueError("memory_ids must be int or 'type:id' string")
+            try:
+                return mem_type.strip().lower(), int(mem_id)
+            except ValueError as exc:
+                raise ValidationIssue(
+                    "memory_ids must include a numeric id",
+                    field="memory_ids",
+                    error_type="invalid_id",
+                ) from exc
+        try:
+            return "observation", int(value)
+        except ValueError as exc:
+            raise ValidationIssue(
+                "memory_ids must include a numeric id",
+                field="memory_ids",
+                error_type="invalid_id",
+            ) from exc
+    raise ValidationIssue(
+        "memory_ids must be int or 'type:id' string",
+        field="memory_ids",
+        error_type="invalid_type",
+    )
 
 
 def _collect_records_by_refs(db, refs: list[tuple[str, int]]) -> list[tuple[str, object]]:
@@ -982,7 +1099,11 @@ def _collect_records_by_refs(db, refs: list[tuple[str, int]]) -> list[tuple[str,
     for mem_type, mem_id in refs:
         model = MEMORY_MODELS.get(mem_type)
         if not model:
-            raise ValueError(f"Unknown memory type: {mem_type}")
+            raise ValidationIssue(
+                f"Unknown memory type: {mem_type}",
+                field="memory_ids",
+                error_type="invalid_type",
+            )
         record = db.query(model).filter(model.id == mem_id).first()
         if record:
             records.append((mem_type, record))
@@ -1037,6 +1158,64 @@ def _collect_summary_threshold_records(
         query = query.filter(MemorySummary.score >= above_score)
         query = query.order_by(MemorySummary.score.desc())
     return query.limit(limit).all()
+
+
+def _record_tool_inventory_count(tool_count: int) -> None:
+    global _LAST_TOOL_COUNT, _TOOL_INVENTORY_EMPTY_LOGGED
+    with _TOOL_REGISTRY_LOCK:
+        if tool_count == 0 and (_LAST_TOOL_COUNT is None or _LAST_TOOL_COUNT > 0):
+            logger.warning(
+                "tool_inventory_empty",
+                extra={"tool_count": tool_count},
+            )
+            _TOOL_INVENTORY_EMPTY_LOGGED = True
+        elif tool_count > 0 and _LAST_TOOL_COUNT == 0:
+            logger.info(
+                "tool_inventory_restored",
+                extra={"tool_count": tool_count},
+            )
+            _TOOL_INVENTORY_EMPTY_LOGGED = False
+        _LAST_TOOL_COUNT = tool_count
+
+
+def _rebind_tool_registry(reason: str) -> None:
+    with _TOOL_REGISTRY_LOCK:
+        for fn, args, kwargs in _REGISTERED_TOOLS:
+            mcp.tool(*args, **kwargs)(fn)
+        tool_count = len(mcp._tool_manager._tools)
+        logger.warning(
+            "tool_registry_rebind",
+            extra={"reason": reason, "tool_count": tool_count},
+        )
+
+
+async def _tool_inventory_status(refresh_if_empty: bool = False, reason: str = "") -> dict:
+    tools = await mcp.get_tools()
+    tool_names = sorted(tools.keys())
+    tool_count = len(tool_names)
+
+    refreshed = False
+    if refresh_if_empty and tool_count == 0:
+        refreshed = True
+        _rebind_tool_registry(reason or "inventory_empty")
+        tools = await mcp.get_tools()
+        tool_names = sorted(tools.keys())
+        tool_count = len(tool_names)
+
+    _record_tool_inventory_count(tool_count)
+
+    return {
+        "tool_count": tool_count,
+        "tools": tool_names,
+        "refreshed": refreshed,
+        "retry_after_seconds": TOOL_INVENTORY_RETRY_SECONDS if tool_count == 0 else None,
+    }
+
+
+async def _mcp_tool_inventory_check() -> dict:
+    return await _tool_inventory_status(refresh_if_empty=True, reason="mcp_request")
+
+
 def get_or_create_ai_instance(db, name: str, platform: str) -> AIInstance:
     """Get or create an AI instance by name."""
     instance = db.query(AIInstance).filter(AIInstance.name == name).first()
@@ -1098,6 +1277,11 @@ MEMORY_MODELS = {
     "concept": Concept,
     "document": Document,
 }
+
+_REGISTERED_TOOLS: list[tuple[Callable[..., dict], tuple[Any, ...], dict[str, Any]]] = []
+_TOOL_REGISTRY_LOCK = threading.Lock()
+_LAST_TOOL_COUNT: Optional[int] = None
+_TOOL_INVENTORY_EMPTY_LOGGED = False
 
 
 def _search_memory_impl(
@@ -1519,7 +1703,17 @@ def _search_memory_keyword_impl(
 READ_ONLY_TOOL_ANNOTATIONS = {"readOnlyHint": True}
 DESTRUCTIVE_TOOL_ANNOTATIONS = {"destructiveHint": True}
 
-@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+
+@mcp.resource(
+    "memorygate://tool-inventory",
+    name="memorygate_tool_inventory",
+    mime_type="application/json",
+)
+async def tool_inventory_resource() -> dict:
+    """Expose tool inventory as a resource for discovery fallbacks."""
+    return await _tool_inventory_status(refresh_if_empty=True, reason="resource_read")
+
+@mcp_tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def memory_search(
     query: str,
     limit: int = 5,
@@ -1557,7 +1751,7 @@ def memory_search(
     )
 
 
-@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+@mcp_tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def search_cold_memory(
     query: str,
     top_k: int = 10,
@@ -1642,7 +1836,7 @@ def search_cold_memory(
     }
 
 
-@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+@mcp_tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def archive_memory(
     memory_ids: Optional[List[str]] = None,
     summary_ids: Optional[List[int]] = None,
@@ -1742,11 +1936,13 @@ def archive_memory(
             }
 
         archived_ids = []
+        already_archived_ids = []
         tombstones_written = 0
         summaries_created = 0
 
         for mem_type, record in candidates:
             if record.tier != MemoryTier.hot:
+                already_archived_ids.append(_serialize_memory_id(mem_type, record.id))
                 continue
 
             if mode == "archive_and_summarize_then_archive":
@@ -1794,6 +1990,7 @@ def archive_memory(
 
         for summary in summary_records:
             if summary.tier != MemoryTier.hot:
+                already_archived_ids.append(f"summary:{summary.id}")
                 continue
             summary.tier = MemoryTier.cold
             summary.archived_at = datetime.utcnow()
@@ -1818,6 +2015,8 @@ def archive_memory(
             "status": "archived",
             "archived_count": len(archived_ids),
             "archived_ids": archived_ids,
+            "already_archived_count": len(already_archived_ids),
+            "already_archived_ids": already_archived_ids,
             "tombstones_written": tombstones_written,
             "summaries_created": summaries_created,
         }
@@ -1825,7 +2024,7 @@ def archive_memory(
         db.close()
 
 
-@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
+@mcp_tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def rehydrate_memory(
     memory_ids: Optional[List[str]] = None,
     summary_ids: Optional[List[int]] = None,
@@ -1928,10 +2127,12 @@ def rehydrate_memory(
             }
 
         rehydrated_ids = []
+        already_hot_ids = []
         tombstones_written = 0
 
         for mem_type, record in candidates:
             if record.tier != MemoryTier.cold:
+                already_hot_ids.append(_serialize_memory_id(mem_type, record.id))
                 continue
             record.tier = MemoryTier.hot
             record.archived_at = None
@@ -1956,6 +2157,7 @@ def rehydrate_memory(
 
         for summary in summary_records:
             if summary.tier != MemoryTier.cold:
+                already_hot_ids.append(f"summary:{summary.id}")
                 continue
             summary.tier = MemoryTier.hot
             summary.archived_at = None
@@ -1984,13 +2186,15 @@ def rehydrate_memory(
             "status": "rehydrated",
             "rehydrated_count": len(rehydrated_ids),
             "rehydrated_ids": rehydrated_ids,
+            "already_hot_count": len(already_hot_ids),
+            "already_hot_ids": already_hot_ids,
             "tombstones_written": tombstones_written,
         }
     finally:
         db.close()
 
 
-@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+@mcp_tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def list_archive_candidates(
     below_score: float = SUMMARY_TRIGGER_SCORE,
     limit: int = ARCHIVE_LIMIT_DEFAULT
@@ -2021,7 +2225,7 @@ def list_archive_candidates(
         db.close()
 
 
-@mcp.tool()
+@mcp_tool()
 def memory_store(
     observation: str,
     confidence: float = 0.8,
@@ -2098,7 +2302,7 @@ def memory_store(
         db.close()
 
 
-@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+@mcp_tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def memory_recall(
     domain: Optional[str] = None,
     min_confidence: float = 0.0,
@@ -2173,7 +2377,7 @@ def memory_recall(
         db.close()
 
 
-@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+@mcp_tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def memory_stats() -> dict:
     """
     Get memory system statistics.
@@ -2246,7 +2450,7 @@ def memory_stats() -> dict:
         db.close()
 
 
-@mcp.tool()
+@mcp_tool()
 def memory_init_session(
     conversation_id: str,
     title: str,
@@ -2293,7 +2497,7 @@ def memory_init_session(
         db.close()
 
 
-@mcp.tool()
+@mcp_tool()
 def memory_store_document(
     title: str,
     doc_type: str,
@@ -2369,7 +2573,7 @@ def memory_store_document(
         db.close()
 
 
-@mcp.tool()
+@mcp_tool()
 def memory_store_concept(
     name: str,
     concept_type: str,
@@ -2452,7 +2656,25 @@ def memory_store_concept(
         db.close()
 
 
-@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+def _resolve_concept_by_name(db, name: str, include_cold: bool) -> Optional[Concept]:
+    name_key = name.lower()
+    concept_query = db.query(Concept).filter(Concept.name_key == name_key)
+    if not include_cold:
+        concept_query = concept_query.filter(Concept.tier == MemoryTier.hot)
+    concept = concept_query.first()
+
+    if not concept:
+        alias = db.query(ConceptAlias).filter(ConceptAlias.alias_key == name_key).first()
+        if alias:
+            concept_query = db.query(Concept).filter(Concept.id == alias.concept_id)
+            if not include_cold:
+                concept_query = concept_query.filter(Concept.tier == MemoryTier.hot)
+            concept = concept_query.first()
+
+    return concept
+
+
+@mcp_tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def memory_get_concept(name: str, include_cold: bool = False) -> dict:
     """
     Get a concept by name (case-insensitive, alias-aware).
@@ -2468,24 +2690,7 @@ def memory_get_concept(name: str, include_cold: bool = False) -> dict:
 
     db = DB.SessionLocal()
     try:
-        name_key = name.lower()
-        
-        # Try direct lookup first
-        concept_query = db.query(Concept).filter(Concept.name_key == name_key)
-        if not include_cold:
-            concept_query = concept_query.filter(Concept.tier == MemoryTier.hot)
-        concept = concept_query.first()
-        
-        # If not found, check aliases
-        if not concept:
-            from models import ConceptAlias
-            alias = db.query(ConceptAlias).filter(ConceptAlias.alias_key == name_key).first()
-            if alias:
-                concept_query = db.query(Concept).filter(Concept.id == alias.concept_id)
-                if not include_cold:
-                    concept_query = concept_query.filter(Concept.tier == MemoryTier.hot)
-                concept = concept_query.first()
-        
+        concept = _resolve_concept_by_name(db, name, include_cold)
         if not concept:
             return {"status": "not_found", "name": name}
         
@@ -2508,7 +2713,7 @@ def memory_get_concept(name: str, include_cold: bool = False) -> dict:
         db.close()
 
 
-@mcp.tool()
+@mcp_tool()
 def memory_add_concept_alias(concept_name: str, alias: str) -> dict:
     """
     Add an alternative name (alias) for a concept.
@@ -2563,7 +2768,7 @@ def memory_add_concept_alias(concept_name: str, alias: str) -> dict:
         db.close()
 
 
-@mcp.tool()
+@mcp_tool()
 def memory_add_concept_relationship(
     from_concept: str,
     to_concept: str,
@@ -2657,7 +2862,7 @@ def memory_add_concept_relationship(
         db.close()
 
 
-@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+@mcp_tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def memory_related_concepts(
     concept_name: str,
     rel_type: Optional[str] = None,
@@ -2684,12 +2889,8 @@ def memory_related_concepts(
     try:
         from models import ConceptRelationship
         
-        # Find the concept
-        concept_key = concept_name.lower()
-        concept_query = db.query(Concept).filter(Concept.name_key == concept_key)
-        if not include_cold:
-            concept_query = concept_query.filter(Concept.tier == MemoryTier.hot)
-        concept = concept_query.first()
+        # Find the concept (alias-aware)
+        concept = _resolve_concept_by_name(db, concept_name, include_cold)
         if not concept:
             return {"status": "not_found", "concept": concept_name}
         
@@ -2755,7 +2956,7 @@ def memory_related_concepts(
         db.close()
 
 
-@mcp.tool()
+@mcp_tool()
 def memory_update_pattern(
     category: str,
     pattern_name: str,
@@ -2797,6 +2998,7 @@ def memory_update_pattern(
 
     db = DB.SessionLocal()
     try:
+        _validate_evidence_observation_ids(db, evidence_observation_ids)
         # Get AI instance and session if provided
         ai_instance_id = None
         session_id = None
@@ -2868,7 +3070,7 @@ def memory_update_pattern(
         db.close()
 
 
-@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+@mcp_tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def memory_get_pattern(category: str, pattern_name: str, include_cold: bool = False) -> dict:
     """
     Get a specific pattern by category and name.
@@ -2920,7 +3122,7 @@ def memory_get_pattern(category: str, pattern_name: str, include_cold: bool = Fa
         db.close()
 
 
-@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+@mcp_tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def memory_patterns(
     category: Optional[str] = None,
     min_confidence: float = 0.0,
@@ -3029,7 +3231,7 @@ CONFIDENCE_GUIDE = {
 }
 
 
-@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+@mcp_tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def memory_user_guide(
     format: str = "markdown",
     verbosity: str = "short"
@@ -3048,9 +3250,17 @@ def memory_user_guide(
         Dictionary with spec_version, guide content, structured metadata
     """
     if format not in {"markdown", "json"}:
-        raise ValueError("format must be 'markdown' or 'json'")
+        raise ValidationIssue(
+            "format must be 'markdown' or 'json'",
+            field="format",
+            error_type="invalid_value",
+        )
     if verbosity not in {"short", "verbose"}:
-        raise ValueError("verbosity must be 'short' or 'verbose'")
+        raise ValidationIssue(
+            "verbosity must be 'short' or 'verbose'",
+            field="verbosity",
+            error_type="invalid_value",
+        )
     
     guide_content = """# MemoryGate User Guide
 
@@ -3133,12 +3343,30 @@ memory_update_pattern(
 
 ## Relationship Types
 {relationship_types}
+
+## Limits (defaults)
+- **Search result limit**: {max_result_limit} (`MEMORYGATE_MAX_RESULT_LIMIT`)
+- **Query length**: {max_query_length} chars (`MEMORYGATE_MAX_QUERY_LENGTH`)
+- **Text length**: {max_text_length} chars (`MEMORYGATE_MAX_TEXT_LENGTH`)
+- **Short text length**: {max_short_text_length} chars (`MEMORYGATE_MAX_SHORT_TEXT_LENGTH`)
+- **Evidence list size**: {max_relationship_items} observation IDs (`MEMORYGATE_MAX_RELATIONSHIP_ITEMS`)
+- **List sizes**: {max_list_items} items (`MEMORYGATE_MAX_LIST_ITEMS`)
+- **Metadata size**: {max_metadata_bytes} bytes (`MEMORYGATE_MAX_METADATA_BYTES`)
+
+Limits can be configured per deployment via the environment variables above.
 """.format(
         spec_version=SPEC_VERSION,
         domains="\n".join(f"- `{d}`" for d in RECOMMENDED_DOMAINS),
         confidence="\n".join(f"- **{k}**: {v}" for k, v in CONFIDENCE_GUIDE.items()),
         concept_types="\n".join(f"- `{ct}`" for ct in CONCEPT_TYPES),
         relationship_types="\n".join(f"- `{rt}`" for rt in RELATIONSHIP_TYPES),
+        max_result_limit=MAX_RESULT_LIMIT,
+        max_query_length=MAX_QUERY_LENGTH,
+        max_text_length=MAX_TEXT_LENGTH,
+        max_short_text_length=MAX_SHORT_TEXT_LENGTH,
+        max_relationship_items=MAX_RELATIONSHIP_ITEMS,
+        max_list_items=MAX_LIST_ITEMS,
+        max_metadata_bytes=MAX_METADATA_BYTES,
     )
     
     result = {
@@ -3166,12 +3394,30 @@ memory_update_pattern(
                 "Documents store references not content",
                 "Search is primary tool",
             ],
+            "limits": {
+                "max_result_limit": MAX_RESULT_LIMIT,
+                "max_query_length": MAX_QUERY_LENGTH,
+                "max_text_length": MAX_TEXT_LENGTH,
+                "max_short_text_length": MAX_SHORT_TEXT_LENGTH,
+                "max_relationship_items": MAX_RELATIONSHIP_ITEMS,
+                "max_list_items": MAX_LIST_ITEMS,
+                "max_metadata_bytes": MAX_METADATA_BYTES,
+            },
+            "limit_env_vars": {
+                "MEMORYGATE_MAX_RESULT_LIMIT": MAX_RESULT_LIMIT,
+                "MEMORYGATE_MAX_QUERY_LENGTH": MAX_QUERY_LENGTH,
+                "MEMORYGATE_MAX_TEXT_LENGTH": MAX_TEXT_LENGTH,
+                "MEMORYGATE_MAX_SHORT_TEXT_LENGTH": MAX_SHORT_TEXT_LENGTH,
+                "MEMORYGATE_MAX_RELATIONSHIP_ITEMS": MAX_RELATIONSHIP_ITEMS,
+                "MEMORYGATE_MAX_LIST_ITEMS": MAX_LIST_ITEMS,
+                "MEMORYGATE_MAX_METADATA_BYTES": MAX_METADATA_BYTES,
+            },
         }
     
     return result
 
 
-@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
+@mcp_tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def memory_bootstrap(ai_name: Optional[str] = None, ai_platform: Optional[str] = None) -> dict:
     """
     Stateful bootstrap for AI agents - tells you your relationship status with MemoryGate.
@@ -3296,29 +3542,73 @@ def memory_bootstrap(ai_name: Optional[str] = None, ai_platform: Optional[str] =
 # FastAPI App
 # =============================================================================
 
-# Create MCP ASGI app
-mcp_app = mcp.http_app(
+# Create MCP ASGI apps
+mcp_sse_app = mcp.http_app(
     path="/",
     transport="sse",
+    stateless_http=True,
+    json_response=True,
+)
+mcp_stream_app = mcp.http_app(
+    path="/",
+    transport="streamable-http",
     stateless_http=True,
     json_response=True,
 )
 
 
 # =============================================================================
-# Pure ASGI wrapper: Normalize /mcp to /mcp/ without buffering
+# Pure ASGI wrapper: Normalize MCP paths and support MemoryGate tool routing
 # =============================================================================
 
-class SlashNormalizerASGI:
+class MCPRouteNormalizerASGI:
     """Pure ASGI middleware - no response buffering, SSE-safe."""
     def __init__(self, wrapped_app):
         self.wrapped_app = wrapped_app
-    
+
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["path"] == "/mcp":
-            scope = dict(scope)  # Make mutable copy
-            scope["path"] = "/mcp/"
+        if scope["type"] == "http":
+            path = scope.get("path")
+            if path == "/mcp":
+                scope = dict(scope)
+                scope["path"] = "/mcp/"
+            elif path == "/MemoryGate":
+                scope = dict(scope)
+                scope["path"] = "/MemoryGate/"
         await self.wrapped_app(scope, receive, send)
+
+
+class MemoryGateAliasASGI:
+    """Handle /MemoryGate/link_<id> routing while preserving SSE root_path."""
+    def __init__(self, mcp_entry_app):
+        self.mcp_entry_app = mcp_entry_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.mcp_entry_app(scope, receive, send)
+            return
+
+        root_path = scope.get("root_path", "")
+        full_path = scope.get("path", "") or "/"
+        relative_path = full_path
+        if root_path and full_path.startswith(root_path):
+            relative_path = full_path[len(root_path):] or "/"
+
+        if relative_path.startswith("/link_"):
+            parts = relative_path.split("/", 2)
+            link_segment = parts[1]
+            remaining_path = "/" + parts[2] if len(parts) > 2 else "/"
+            new_scope = dict(scope)
+            new_scope["root_path"] = f"{root_path.rstrip('/')}/{link_segment}"
+            new_scope["path"] = remaining_path
+            new_scope["raw_path"] = remaining_path.encode()
+            await self.mcp_entry_app(new_scope, receive, send)
+            return
+
+        new_scope = dict(scope)
+        new_scope["path"] = relative_path
+        new_scope["raw_path"] = relative_path.encode()
+        await self.mcp_entry_app(new_scope, receive, send)
 
 
 @asynccontextmanager
@@ -3336,30 +3626,33 @@ async def lifespan(app: FastAPI):
         await asyncio.to_thread(_run_embedding_backfill)
         if EMBEDDING_BACKFILL_INTERVAL_SECONDS > 0:
             embedding_backfill_task = asyncio.create_task(_embedding_backfill_loop())
-    yield
-    if retention_task:
-        retention_task.cancel()
-        try:
-            await retention_task
-        except asyncio.CancelledError:
-            pass
-    if cleanup_task:
-        cleanup_task.cancel()
-        try:
-            await cleanup_task
-        except asyncio.CancelledError:
-            pass
-    if embedding_backfill_task:
-        embedding_backfill_task.cancel()
-        try:
-            await embedding_backfill_task
-        except asyncio.CancelledError:
-            pass
-    cleanup_http_client()
-    if rate_limiter:
-        await rate_limiter.close()
-    if DB.engine:
-        DB.engine.dispose()
+    try:
+        async with mcp_stream_app.lifespan(mcp_stream_app):
+            yield
+    finally:
+        if retention_task:
+            retention_task.cancel()
+            try:
+                await retention_task
+            except asyncio.CancelledError:
+                pass
+        if cleanup_task:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
+        if embedding_backfill_task:
+            embedding_backfill_task.cancel()
+            try:
+                await embedding_backfill_task
+            except asyncio.CancelledError:
+                pass
+        cleanup_http_client()
+        if rate_limiter:
+            await rate_limiter.close()
+        if DB.engine:
+            DB.engine.dispose()
 
 
 app = FastAPI(title="MemoryGate", redirect_slashes=False, lifespan=lifespan)
@@ -3501,6 +3794,20 @@ async def health():
     }
 
 
+@app.get("/health/tools")
+async def health_tools():
+    """Tool inventory health check."""
+    tool_inventory = await _tool_inventory_status()
+    if tool_inventory.get("tool_count", 0) == 0:
+        raise HTTPException(status_code=503, detail={"tool_inventory": tool_inventory})
+
+    return {
+        "status": "healthy",
+        "service": "MemoryGate",
+        "tool_inventory": tool_inventory,
+    }
+
+
 @app.get("/health/deps")
 async def health_deps():
     """Dependency health checks (optional embedding provider probe)."""
@@ -3533,6 +3840,7 @@ async def root():
             "health": "/health",
             "health_deps": "/health/deps",
             "mcp": "/mcp",
+            "memorygate": "/MemoryGate",
             "auth": {
                 "client_credentials": "/auth/client",
                 "login_google": "/auth/login/google",
@@ -3544,16 +3852,19 @@ async def root():
     }
 
 
-# Mount MCP app at /mcp/ with auth gate (pass DB class for dynamic lookup)
-app.mount("/mcp/", MCPAuthGateASGI(mcp_app, lambda: DB.SessionLocal))
+# Mount MCP apps with auth gate (pass DB class for dynamic lookup)
+mcp_sse_entry_app = MCPAuthGateASGI(mcp_sse_app, lambda: DB.SessionLocal, _mcp_tool_inventory_check)
+mcp_stream_entry_app = MCPAuthGateASGI(mcp_stream_app, lambda: DB.SessionLocal, _mcp_tool_inventory_check)
+app.mount("/mcp/", mcp_sse_entry_app)
+app.mount("/MemoryGate", MemoryGateAliasASGI(mcp_stream_entry_app))
 
 
 # =============================================================================
 # ASGI Application (module-level for production deployment)
 # =============================================================================
 
-# Wrap entire app with slash normalizer to handle /mcp -> /mcp/
-asgi_app = SlashNormalizerASGI(app)
+# Wrap entire app with MCP route normalizer
+asgi_app = MCPRouteNormalizerASGI(app)
 
 
 # =============================================================================

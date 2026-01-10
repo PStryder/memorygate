@@ -169,8 +169,8 @@ POST /auth/client
 Content-Type: application/json
 
 {
-  "client_id": "PSTRYDER_DESKTOP",
-  "client_secret": "aEVFvb8tXf_Ppy9WbelF1cutjrvEP3Zn"
+  "client_id": "your-client-id",
+  "client_secret": "your-client-secret"
 }
 ```
 
@@ -194,8 +194,8 @@ Content-Type: application/json
 
 **Environment Variables Required:**
 ```bash
-fly secrets set PSTRYDER_DESKTOP=ZEaaiWOQfw
-fly secrets set PSTRYDER_DESKTOP_SECRET=aEVFvb8tXf_Ppy9WbelF1cutjrvEP3Zn
+fly secrets set PSTRYDER_DESKTOP=your-client-id
+fly secrets set PSTRYDER_DESKTOP_SECRET=your-client-secret
 ```
 
 **Usage Flow:**
@@ -204,7 +204,7 @@ fly secrets set PSTRYDER_DESKTOP_SECRET=aEVFvb8tXf_Ppy9WbelF1cutjrvEP3Zn
    ```bash
    curl -X POST https://memorygate.fly.dev/auth/client \
      -H "Content-Type: application/json" \
-     -d '{"client_id":"PSTRYDER_DESKTOP","client_secret":"aEVFvb8tXf_Ppy9WbelF1cutjrvEP3Zn"}'
+     -d '{"client_id":"your-client-id","client_secret":"your-client-secret"}'
    ```
 
 2. **Store returned API key** in your environment:

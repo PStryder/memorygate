@@ -17,13 +17,14 @@ from sqlalchemy.dialects.postgresql import UUID, JSONB
 from models import Base  # Import existing Base
 
 DB_BACKEND = os.environ.get("DB_BACKEND", "postgres").strip().lower()
-JSON_TYPE = JSONB if DB_BACKEND == "postgres" else JSON
-UUID_TYPE = UUID(as_uuid=True) if DB_BACKEND == "postgres" else String(36)
+DB_BACKEND_EFFECTIVE = DB_BACKEND if DB_BACKEND in {"postgres", "sqlite"} else "postgres"
+JSON_TYPE = JSONB if DB_BACKEND_EFFECTIVE == "postgres" else JSON
+UUID_TYPE = UUID(as_uuid=True) if DB_BACKEND_EFFECTIVE == "postgres" else String(36)
 
 
 def _uuid_default():
     value = uuid.uuid4()
-    return value if DB_BACKEND == "postgres" else str(value)
+    return value if DB_BACKEND_EFFECTIVE == "postgres" else str(value)
 
 
 class User(Base):

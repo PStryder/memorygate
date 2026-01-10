@@ -17,32 +17,38 @@ from sqlalchemy.orm import relationship, declarative_base
 DB_BACKEND = os.environ.get("DB_BACKEND", "postgres").strip().lower()
 VECTOR_BACKEND = os.environ.get("VECTOR_BACKEND", "pgvector").strip().lower()
 
-if DB_BACKEND not in {"postgres", "sqlite"}:
-    raise RuntimeError("DB_BACKEND must be 'postgres' or 'sqlite'")
-if VECTOR_BACKEND not in {"pgvector", "sqlite_vss", "none"}:
-    raise RuntimeError("VECTOR_BACKEND must be 'pgvector', 'sqlite_vss', or 'none'")
-if DB_BACKEND == "sqlite" and VECTOR_BACKEND == "pgvector":
-    raise RuntimeError("VECTOR_BACKEND=pgvector requires DB_BACKEND=postgres")
-if DB_BACKEND == "postgres" and VECTOR_BACKEND == "sqlite_vss":
-    raise RuntimeError("VECTOR_BACKEND=sqlite_vss requires DB_BACKEND=sqlite")
+DB_BACKEND_EFFECTIVE = DB_BACKEND if DB_BACKEND in {"postgres", "sqlite"} else "postgres"
+VECTOR_BACKEND_EFFECTIVE = (
+    VECTOR_BACKEND if VECTOR_BACKEND in {"pgvector", "sqlite_vss", "none"} else "none"
+)
+if DB_BACKEND_EFFECTIVE == "sqlite" and VECTOR_BACKEND_EFFECTIVE == "pgvector":
+    VECTOR_BACKEND_EFFECTIVE = "none"
+if DB_BACKEND_EFFECTIVE == "postgres" and VECTOR_BACKEND_EFFECTIVE == "sqlite_vss":
+    VECTOR_BACKEND_EFFECTIVE = "none"
 
-EMBEDDING_COLUMN_TYPE = None
-if DB_BACKEND == "postgres" and VECTOR_BACKEND == "pgvector":
-    try:
-        from pgvector.sqlalchemy import Vector as PgVector
-    except ImportError as exc:
-        raise RuntimeError("pgvector is required when VECTOR_BACKEND=pgvector") from exc
+try:
+    from pgvector.sqlalchemy import Vector as PgVector
+    PGVECTOR_AVAILABLE = True
+except Exception:
+    PgVector = None
+    PGVECTOR_AVAILABLE = False
+
+if (
+    DB_BACKEND_EFFECTIVE == "postgres"
+    and VECTOR_BACKEND_EFFECTIVE == "pgvector"
+    and PGVECTOR_AVAILABLE
+):
     EMBEDDING_COLUMN_TYPE = PgVector(1536)
 else:
     EMBEDDING_COLUMN_TYPE = JSON
 
-JSON_TYPE = JSONB if DB_BACKEND == "postgres" else JSON
-UUID_TYPE = UUID(as_uuid=True) if DB_BACKEND == "postgres" else String(36)
+JSON_TYPE = JSONB if DB_BACKEND_EFFECTIVE == "postgres" else JSON
+UUID_TYPE = UUID(as_uuid=True) if DB_BACKEND_EFFECTIVE == "postgres" else String(36)
 
 
 def _uuid_default() -> str | uuid.UUID:
     value = uuid.uuid4()
-    return value if DB_BACKEND == "postgres" else str(value)
+    return value if DB_BACKEND_EFFECTIVE == "postgres" else str(value)
 
 Base = declarative_base()
 

@@ -5,8 +5,8 @@
 ### Step 1: Set Server Secrets
 
 ```bash
-fly secrets set PSTRYDER_DESKTOP=ZEaaiWOQfw
-fly secrets set PSTRYDER_DESKTOP_SECRET=aEVFvb8tXf_Ppy9WbelF1cutjrvEP3Zn
+fly secrets set PSTRYDER_DESKTOP=your-client-id
+fly secrets set PSTRYDER_DESKTOP_SECRET=your-client-secret
 ```
 
 ### Step 2: Exchange Credentials for API Key
@@ -17,8 +17,8 @@ fly secrets set PSTRYDER_DESKTOP_SECRET=aEVFvb8tXf_Ppy9WbelF1cutjrvEP3Zn
 curl -X POST https://memorygate.fly.dev/auth/client \
   -H "Content-Type: application/json" \
   -d '{
-    "client_id": "PSTRYDER_DESKTOP",
-    "client_secret": "aEVFvb8tXf_Ppy9WbelF1cutjrvEP3Zn"
+    "client_id": "your-client-id",
+    "client_secret": "your-client-secret"
   }'
 ```
 

@@ -27,7 +27,7 @@ import numpy as np
 from models import (
     Base, AIInstance, Session, Observation, Pattern, 
     Concept, ConceptAlias, ConceptRelationship, Document, Embedding,
-    MemorySummary, MemoryTombstone, MemoryTier, TombstoneAction
+    MemorySummary, MemoryTombstone, MemoryTier, TombstoneAction, PGVECTOR_AVAILABLE
 )
 from oauth_models import cleanup_expired_sessions, cleanup_expired_states
 from rate_limiter import (
@@ -57,13 +57,6 @@ VECTOR_BACKEND = os.environ.get("VECTOR_BACKEND", "pgvector").strip().lower()
 SQLITE_PATH = os.environ.get("SQLITE_PATH", "/data/memorygate.db")
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
-if not DATABASE_URL:
-    if DB_BACKEND == "sqlite":
-        if not SQLITE_PATH:
-            raise RuntimeError("SQLITE_PATH environment variable is required for sqlite")
-        DATABASE_URL = f"sqlite:///{SQLITE_PATH}"
-    else:
-        raise RuntimeError("DATABASE_URL environment variable is required")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 
@@ -124,6 +117,8 @@ MAX_STATUS_LENGTH = _get_int("MEMORYGATE_MAX_STATUS_LENGTH", 50)
 MAX_METADATA_BYTES = _get_int("MEMORYGATE_MAX_METADATA_BYTES", 20000)
 MAX_LIST_ITEMS = _get_int("MEMORYGATE_MAX_LIST_ITEMS", 50)
 MAX_LIST_ITEM_LENGTH = _get_int("MEMORYGATE_MAX_LIST_ITEM_LENGTH", 1000)
+MAX_TAG_ITEMS = _get_int("MEMORYGATE_MAX_TAG_ITEMS", MAX_LIST_ITEMS)
+MAX_RELATIONSHIP_ITEMS = _get_int("MEMORYGATE_MAX_RELATIONSHIP_ITEMS", MAX_LIST_ITEMS)
 MAX_EMBEDDING_TEXT_LENGTH = _get_int("MEMORYGATE_MAX_EMBEDDING_TEXT_LENGTH", 8000)
 
 # OpenAI retry/backoff
@@ -167,48 +162,78 @@ rate_limiter = build_rate_limiter_from_env(rate_limit_config)
 request_size_config = load_request_size_limit_config_from_env()
 security_headers_config = load_security_headers_config_from_env()
 
-if DB_BACKEND not in {"postgres", "sqlite"}:
-    raise RuntimeError("DB_BACKEND must be 'postgres' or 'sqlite'")
-
-if VECTOR_BACKEND not in {"pgvector", "sqlite_vss", "none"}:
-    raise RuntimeError("VECTOR_BACKEND must be 'pgvector', 'sqlite_vss', or 'none'")
-
-if DB_BACKEND == "sqlite" and VECTOR_BACKEND == "pgvector":
-    raise RuntimeError("VECTOR_BACKEND=pgvector requires DB_BACKEND=postgres")
-
-if DB_BACKEND == "postgres" and VECTOR_BACKEND == "sqlite_vss":
-    raise RuntimeError("VECTOR_BACKEND=sqlite_vss requires DB_BACKEND=sqlite")
-
-url_lower = DATABASE_URL.lower()
-is_sqlite_url = url_lower.startswith("sqlite")
-if is_sqlite_url and DB_BACKEND != "sqlite":
-    raise RuntimeError("DATABASE_URL is sqlite but DB_BACKEND is not 'sqlite'")
-if not is_sqlite_url and DB_BACKEND == "sqlite":
-    raise RuntimeError("DB_BACKEND=sqlite requires a sqlite DATABASE_URL")
-
-if TENANCY_MODE != "single":
-    raise RuntimeError(
-        "Only single-tenant mode is supported. Set MEMORYGATE_TENANCY_MODE=single."
-    )
-
-if EMBEDDING_PROVIDER not in {"openai", "local_cpd", "none"}:
-    raise RuntimeError(
-        "Unknown EMBEDDING_PROVIDER. Use 'openai', 'local_cpd', or 'none'."
-    )
-
-if EMBEDDING_PROVIDER == "openai" and not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY environment variable is required")
-
-if FORGET_MODE not in {"soft", "hard"}:
-    raise RuntimeError("FORGET_MODE must be 'soft' or 'hard'")
-
 VECTOR_BACKEND_EFFECTIVE = VECTOR_BACKEND
-if VECTOR_BACKEND == "sqlite_vss":
-    VECTOR_BACKEND_EFFECTIVE = "none"
-    logger.warning("VECTOR_BACKEND=sqlite_vss is not configured; falling back to keyword search.")
 
-if VECTOR_BACKEND_EFFECTIVE == "pgvector" and EMBEDDING_PROVIDER == "none":
-    raise RuntimeError("VECTOR_BACKEND=pgvector requires EMBEDDING_PROVIDER to be set")
+
+def validate_and_prepare_config() -> None:
+    """Validate configuration and apply derived settings at startup."""
+    global DATABASE_URL, VECTOR_BACKEND_EFFECTIVE
+
+    errors = []
+    if DB_BACKEND not in {"postgres", "sqlite"}:
+        errors.append("DB_BACKEND must be 'postgres' or 'sqlite'")
+
+    if VECTOR_BACKEND not in {"pgvector", "sqlite_vss", "none"}:
+        errors.append("VECTOR_BACKEND must be 'pgvector', 'sqlite_vss', or 'none'")
+
+    if DB_BACKEND == "sqlite" and VECTOR_BACKEND == "pgvector":
+        errors.append("VECTOR_BACKEND=pgvector requires DB_BACKEND=postgres")
+
+    if DB_BACKEND == "postgres" and VECTOR_BACKEND == "sqlite_vss":
+        errors.append("VECTOR_BACKEND=sqlite_vss requires DB_BACKEND=sqlite")
+
+    if not DATABASE_URL:
+        if DB_BACKEND == "sqlite":
+            if not SQLITE_PATH:
+                errors.append("SQLITE_PATH environment variable is required for sqlite")
+            else:
+                DATABASE_URL = f"sqlite:///{SQLITE_PATH}"
+        else:
+            errors.append("DATABASE_URL environment variable is required")
+    else:
+        url_lower = DATABASE_URL.lower()
+        is_sqlite_url = url_lower.startswith("sqlite")
+        if is_sqlite_url and DB_BACKEND != "sqlite":
+            errors.append("DATABASE_URL is sqlite but DB_BACKEND is not 'sqlite'")
+        if not is_sqlite_url and DB_BACKEND == "sqlite":
+            errors.append("DB_BACKEND=sqlite requires a sqlite DATABASE_URL")
+
+    if TENANCY_MODE != "single":
+        errors.append(
+            "Only single-tenant mode is supported. Set MEMORYGATE_TENANCY_MODE=single."
+        )
+
+    if EMBEDDING_PROVIDER not in {"openai", "local_cpd", "none"}:
+        errors.append("Unknown EMBEDDING_PROVIDER. Use 'openai', 'local_cpd', or 'none'.")
+
+    if EMBEDDING_PROVIDER == "openai" and not OPENAI_API_KEY:
+        errors.append("OPENAI_API_KEY environment variable is required")
+
+    if FORGET_MODE not in {"soft", "hard"}:
+        errors.append("FORGET_MODE must be 'soft' or 'hard'")
+
+    vector_backend_effective = (
+        VECTOR_BACKEND if VECTOR_BACKEND in {"pgvector", "sqlite_vss", "none"} else "none"
+    )
+    if VECTOR_BACKEND == "sqlite_vss":
+        vector_backend_effective = "none"
+        logger.warning(
+            "VECTOR_BACKEND=sqlite_vss is not configured; falling back to keyword search."
+        )
+    if DB_BACKEND == "sqlite" and vector_backend_effective == "pgvector":
+        vector_backend_effective = "none"
+    if DB_BACKEND == "postgres" and vector_backend_effective == "sqlite_vss":
+        vector_backend_effective = "none"
+    VECTOR_BACKEND_EFFECTIVE = vector_backend_effective
+
+    if VECTOR_BACKEND_EFFECTIVE == "pgvector" and EMBEDDING_PROVIDER == "none":
+        errors.append("VECTOR_BACKEND=pgvector requires EMBEDDING_PROVIDER to be set")
+
+    if VECTOR_BACKEND_EFFECTIVE == "pgvector" and not PGVECTOR_AVAILABLE:
+        errors.append("pgvector package is required when VECTOR_BACKEND=pgvector")
+
+    if errors:
+        raise RuntimeError("Configuration invalid: " + "; ".join(errors))
 
 # =============================================================================
 # Global State
@@ -507,7 +532,8 @@ def _run_retention_tick() -> None:
 
 def init_db():
     """Initialize database connection and create tables."""
-    
+    validate_and_prepare_config()
+
     logger.info("Connecting to database...")
     engine_kwargs = {"pool_pre_ping": True}
     if DB_BACKEND == "sqlite":
@@ -811,7 +837,7 @@ embedding_circuit_breaker = EmbeddingCircuitBreaker(
 
 
 def _raise_embedding_unavailable(detail: str) -> None:
-    logger.warning(f"Embedding provider unavailable: {detail}")
+    logger.warning("Embedding provider unavailable")
     raise EmbeddingProviderError("embedding provider unavailable")
 
 
@@ -1381,7 +1407,11 @@ def _search_memory_keyword_impl(
         }
     finally:
         db.close()
-@mcp.tool()
+
+READ_ONLY_TOOL_ANNOTATIONS = {"readOnlyHint": True}
+DESTRUCTIVE_TOOL_ANNOTATIONS = {"destructiveHint": True}
+
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def memory_search(
     query: str,
     limit: int = 5,
@@ -1419,7 +1449,7 @@ def memory_search(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def search_cold_memory(
     query: str,
     top_k: int = 10,
@@ -1443,7 +1473,7 @@ def search_cold_memory(
     _validate_limit(top_k, "top_k", 50)
     _validate_optional_text(type_filter, "type_filter", MAX_SHORT_TEXT_LENGTH)
     _validate_optional_text(source, "source", MAX_SHORT_TEXT_LENGTH)
-    _validate_string_list(tags, "tags", MAX_LIST_ITEMS, MAX_LIST_ITEM_LENGTH)
+    _validate_string_list(tags, "tags", MAX_TAG_ITEMS, MAX_LIST_ITEM_LENGTH)
 
     dt_from = None
     dt_to = None
@@ -1504,7 +1534,7 @@ def search_cold_memory(
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def archive_memory(
     memory_ids: Optional[List[str]] = None,
     summary_ids: Optional[List[int]] = None,
@@ -1687,7 +1717,7 @@ def archive_memory(
         db.close()
 
 
-@mcp.tool()
+@mcp.tool(annotations=DESTRUCTIVE_TOOL_ANNOTATIONS)
 def rehydrate_memory(
     memory_ids: Optional[List[str]] = None,
     summary_ids: Optional[List[int]] = None,
@@ -1852,7 +1882,7 @@ def rehydrate_memory(
         db.close()
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def list_archive_candidates(
     below_score: float = SUMMARY_TRIGGER_SCORE,
     limit: int = ARCHIVE_LIMIT_DEFAULT
@@ -1960,7 +1990,7 @@ def memory_store(
         db.close()
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def memory_recall(
     domain: Optional[str] = None,
     min_confidence: float = 0.0,
@@ -2035,7 +2065,7 @@ def memory_recall(
         db.close()
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def memory_stats() -> dict:
     """
     Get memory system statistics.
@@ -2199,7 +2229,7 @@ def memory_store_document(
             try:
                 pub_date = datetime.fromisoformat(publication_date.replace('Z', '+00:00'))
             except ValueError:
-                logger.warning(f"Invalid publication_date format: {publication_date}")
+                logger.warning("Invalid publication_date format")
         
         # Create document
         doc = Document(
@@ -2314,7 +2344,7 @@ def memory_store_concept(
         db.close()
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def memory_get_concept(name: str, include_cold: bool = False) -> dict:
     """
     Get a concept by name (case-insensitive, alias-aware).
@@ -2519,7 +2549,7 @@ def memory_add_concept_relationship(
         db.close()
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def memory_related_concepts(
     concept_name: str,
     rel_type: Optional[str] = None,
@@ -2652,7 +2682,7 @@ def memory_update_pattern(
     _validate_required_text(pattern_name, "pattern_name", MAX_SHORT_TEXT_LENGTH)
     _validate_required_text(pattern_text, "pattern_text", MAX_TEXT_LENGTH)
     _validate_confidence(confidence, "confidence")
-    _validate_list(evidence_observation_ids, "evidence_observation_ids", MAX_LIST_ITEMS)
+    _validate_list(evidence_observation_ids, "evidence_observation_ids", MAX_RELATIONSHIP_ITEMS)
     _validate_optional_text(ai_name, "ai_name", MAX_SHORT_TEXT_LENGTH)
     _validate_optional_text(ai_platform, "ai_platform", MAX_SHORT_TEXT_LENGTH)
     _validate_optional_text(conversation_id, "conversation_id", MAX_SHORT_TEXT_LENGTH)
@@ -2730,7 +2760,7 @@ def memory_update_pattern(
         db.close()
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def memory_get_pattern(category: str, pattern_name: str, include_cold: bool = False) -> dict:
     """
     Get a specific pattern by category and name.
@@ -2782,7 +2812,7 @@ def memory_get_pattern(category: str, pattern_name: str, include_cold: bool = Fa
         db.close()
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def memory_patterns(
     category: Optional[str] = None,
     min_confidence: float = 0.0,
@@ -2891,7 +2921,7 @@ CONFIDENCE_GUIDE = {
 }
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def memory_user_guide(
     format: str = "markdown",
     verbosity: str = "short"
@@ -3033,7 +3063,7 @@ memory_update_pattern(
     return result
 
 
-@mcp.tool()
+@mcp.tool(annotations=READ_ONLY_TOOL_ANNOTATIONS)
 def memory_bootstrap(ai_name: Optional[str] = None, ai_platform: Optional[str] = None) -> dict:
     """
     Stateful bootstrap for AI agents - tells you your relationship status with MemoryGate.
@@ -3287,6 +3317,39 @@ def _check_db_health() -> dict:
         "schema_up_to_date": schema_ok,
     }
 
+
+def _check_embedding_health(check_external: bool) -> dict:
+    breaker_status = embedding_circuit_breaker.status()
+    embedding_status = {
+        "status": "unknown",
+        "provider": EMBEDDING_PROVIDER,
+        "circuit_breaker": breaker_status,
+        "checked": False,
+    }
+
+    if EMBEDDING_PROVIDER == "none":
+        embedding_status["status"] = "disabled"
+        return embedding_status
+
+    if breaker_status.get("open"):
+        embedding_status["status"] = "cooldown"
+        return embedding_status
+
+    if check_external and EMBEDDING_HEALTHCHECK_ENABLED:
+        embedding_status["checked"] = True
+        start = time.time()
+        try:
+            embed_text_sync("healthcheck")
+            embedding_status["status"] = "ok"
+            embedding_status["latency_ms"] = int((time.time() - start) * 1000)
+        except EmbeddingProviderError as exc:
+            embedding_status["status"] = "error"
+            embedding_status["error"] = str(exc)
+        return embedding_status
+
+    embedding_status["status"] = "skipped" if check_external else "ready"
+    return embedding_status
+
 # Mount OAuth discovery and authorization routes (for Claude Desktop MCP)
 from oauth_discovery import router as oauth_discovery_router
 app.include_router(oauth_discovery_router)
@@ -3301,9 +3364,13 @@ app.include_router(auth_router)
 async def health():
     """Health check endpoint."""
     db_health = _check_db_health()
+    embedding_status = _check_embedding_health(check_external=False)
     vector_required = DB_BACKEND == "postgres" and VECTOR_BACKEND_EFFECTIVE == "pgvector"
     if not db_health.get("ok") or (vector_required and not db_health.get("pgvector_installed")):
-        raise HTTPException(status_code=503, detail=db_health)
+        raise HTTPException(
+            status_code=503,
+            detail={"database": db_health, "embedding_provider": embedding_status},
+        )
 
     return {
         "status": "healthy",
@@ -3312,6 +3379,7 @@ async def health():
         "instance_id": os.environ.get("MEMORYGATE_INSTANCE_ID", "memorygate-1"),
         "tenant_mode": TENANCY_MODE,
         "database": db_health,
+        "embedding_provider": embedding_status,
     }
 
 
@@ -3323,30 +3391,7 @@ async def health_deps():
     if not db_health.get("ok") or (vector_required and not db_health.get("pgvector_installed")):
         raise HTTPException(status_code=503, detail={"database": db_health})
 
-    breaker_status = embedding_circuit_breaker.status()
-    embedding_status = {
-        "status": "unknown",
-        "provider": EMBEDDING_PROVIDER,
-        "circuit_breaker": breaker_status,
-        "checked": False,
-    }
-
-    if EMBEDDING_PROVIDER == "none":
-        embedding_status["status"] = "disabled"
-    elif breaker_status.get("open"):
-        embedding_status["status"] = "cooldown"
-    elif EMBEDDING_HEALTHCHECK_ENABLED:
-        embedding_status["checked"] = True
-        start = time.time()
-        try:
-            embed_text_sync("healthcheck")
-            embedding_status["status"] = "ok"
-            embedding_status["latency_ms"] = int((time.time() - start) * 1000)
-        except EmbeddingProviderError as exc:
-            embedding_status["status"] = "error"
-            embedding_status["error"] = str(exc)
-    else:
-        embedding_status["status"] = "skipped"
+    embedding_status = _check_embedding_health(check_external=True)
 
     return {
         "status": "healthy",

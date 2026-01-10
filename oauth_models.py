@@ -172,7 +172,7 @@ class APIKey(Base):
     user_id = Column(UUID_TYPE, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     
     # Key components
-    key_prefix = Column(String, nullable=False)  # First 8 chars for identification
+    key_prefix = Column(String, nullable=False)  # First 11 chars for identification
     key_hash = Column(String, nullable=False, unique=True)  # bcrypt hash of full key
     
     # Key metadata

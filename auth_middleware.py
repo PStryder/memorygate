@@ -82,31 +82,31 @@ def verify_request_api_key(db: Session, headers: dict) -> Optional[User]:
     
     key_prefix = api_key[:11]
     
-    # Find key by prefix
-    api_key_obj = db.query(APIKey).filter(
+    # Find keys by prefix (prefix collisions are possible)
+    api_keys = db.query(APIKey).filter(
         APIKey.key_prefix == key_prefix
-    ).first()
-    
-    if not api_key_obj:
-        return None
-    
-    # Verify full key against hash
-    if not verify_api_key(api_key, api_key_obj.key_hash):
-        return None
-    
-    # Check validity
-    if not api_key_obj.is_valid:
-        return None
-    
-    user = api_key_obj.user
-    if not user or not user.is_active:
+    ).all()
+
+    if not api_keys:
         return None
 
-    # Update usage tracking
-    api_key_obj.increment_usage()
-    db.commit()
-    
-    return user
+    # Verify full key against hash
+    for api_key_obj in api_keys:
+        if not verify_api_key(api_key, api_key_obj.key_hash):
+            continue
+        if not api_key_obj.is_valid:
+            return None
+        user = api_key_obj.user
+        if not user or not user.is_active:
+            return None
+
+        # Update usage tracking
+        api_key_obj.increment_usage()
+        db.commit()
+
+        return user
+
+    return None
 
 
 
@@ -156,31 +156,31 @@ async def get_current_user_from_api_key(
     
     key_prefix = api_key[:11]
     
-    # Find key by prefix
-    api_key_obj = db.query(APIKey).filter(
+    # Find keys by prefix (prefix collisions are possible)
+    api_keys = db.query(APIKey).filter(
         APIKey.key_prefix == key_prefix
-    ).first()
-    
-    if not api_key_obj:
-        return None
-    
-    # Verify full key against hash
-    if not verify_api_key(api_key, api_key_obj.key_hash):
-        return None
-    
-    # Check validity
-    if not api_key_obj.is_valid:
-        return None
-    
-    user = api_key_obj.user
-    if not user or not user.is_active:
+    ).all()
+
+    if not api_keys:
         return None
 
-    # Update usage tracking
-    api_key_obj.increment_usage()
-    db.commit()
-    
-    return user
+    # Verify full key against hash
+    for api_key_obj in api_keys:
+        if not verify_api_key(api_key, api_key_obj.key_hash):
+            continue
+        if not api_key_obj.is_valid:
+            return None
+        user = api_key_obj.user
+        if not user or not user.is_active:
+            return None
+
+        # Update usage tracking
+        api_key_obj.increment_usage()
+        db.commit()
+
+        return user
+
+    return None
 
 
 async def get_current_user(
